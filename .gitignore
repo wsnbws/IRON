@@ -1,0 +1,10 @@
+# dataset 
+data/
+
+# output
+out/
+
+# mmseg
+mmseg/
+
+*.pyc
