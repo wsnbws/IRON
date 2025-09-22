@@ -40,7 +40,7 @@ def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.
     if kargs.get("layer_id", None) is not None:
         if kargs["layer_id"] == 3:
             save_atten = attn_weight.detach().cpu().numpy()
-            np.save(f"/public/home/wangshuo/DrivableTask/out/DrivableSeg/deform_atten/v3_2/atten_vis/saved_weights/{kargs['basename']}_cross_attn_weight_{kargs['layer_id']}.npy", save_atten)
+            np.save(f"/home/wangshuo/otdr/out/atten_weights/{kargs['basename']}_cross_attn_weight_{kargs['layer_id']}.npy", save_atten)
     attn_weight += attn_bias
     attn_weight = torch.softmax(attn_weight, dim=-1)
     attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
