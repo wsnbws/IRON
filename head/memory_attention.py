@@ -13,6 +13,7 @@ from .untils import get_activation_fn, get_clones
 import torch.nn.functional as F
 from .position_embed import apply_rotary_enc, compute_axial_cis
 import numpy as np
+TEST = False
 
 # Efficient implementation equivalent to the following:
 def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,
@@ -37,12 +38,20 @@ def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.
         value = value.repeat_interleave(query.size(-3)//value.size(-3), -3)
 
     attn_weight = query @ key.transpose(-2, -1) * scale_factor
-    if kargs.get("layer_id", None) is not None:
-        if kargs["layer_id"] == 3:
+    attn_weight += attn_bias
+
+    # B, H, L, S_total = attn_weight.shape
+    # T = 4  
+    # S = S_total // T
+    # attn_weight = attn_weight.view(B, H, L, T, S)
+    # attn_weight = torch.softmax(attn_weight/0.7, dim=-1)
+    # attn_weight = attn_weight / attn_weight.sum(dim=(3,4), keepdim=True)  # 跨帧归一化
+    # attn_weight = attn_weight.view(B, H, L, S_total)
+    attn_weight = torch.softmax(attn_weight, dim=-1)
+    if kargs.get("layer_id", None) is not None and TEST:
+        if kargs["layer_id"] == 5:
             save_atten = attn_weight.detach().cpu().numpy()
             np.save(f"/home/wangshuo/otdr/out/atten_weights/{kargs['basename']}_cross_attn_weight_{kargs['layer_id']}.npy", save_atten)
-    attn_weight += attn_bias
-    attn_weight = torch.softmax(attn_weight, dim=-1)
     attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
     return attn_weight @ value
 
@@ -245,7 +254,7 @@ class MemoryAttentionLayer(nn.Module):
             **kargs
         )
         tgt = tgt + self.dropout2(tgt2)
-        return tgt
+        return tgt, tgt2
 
     def forward(
         self,
@@ -260,12 +269,12 @@ class MemoryAttentionLayer(nn.Module):
 
         # Self-Attn, Cross-Attn
         tgt = self._forward_sa(tgt, query_pos, spatial_shape=spatial_shape)
-        tgt = self._forward_ca(tgt, memory, query_pos, pos, num_k_exclude_rope, spatial_shape=spatial_shape, **kargs)
+        tgt, tem_tgt = self._forward_ca(tgt, memory, query_pos, pos, num_k_exclude_rope, spatial_shape=spatial_shape, **kargs)
         # MLP
         tgt2 = self.norm3(tgt)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
         tgt = tgt + self.dropout3(tgt2)
-        return tgt
+        return tgt, tem_tgt
 
 
 class MemoryAttention(nn.Module):
@@ -325,7 +334,7 @@ class MemoryAttention(nn.Module):
                 if not self.training:
                     kargs["layer_id"] = layer_id
 
-            output = layer(
+            output, tmp_tgt = layer(
                 tgt=output,
                 memory=memory,
                 pos=memory_pos,
@@ -335,10 +344,12 @@ class MemoryAttention(nn.Module):
                 **kargs,
             )
         normed_output = self.norm(output)
+        normed_tmp_tgt = self.norm(tmp_tgt)
 
         if self.batch_first:
             # Convert back to seq first
             normed_output = normed_output.transpose(0, 1)
             curr_pos = curr_pos.transpose(0, 1)
+            normed_tmp_tgt = normed_tmp_tgt.transpose(0, 1)
 
-        return normed_output
+        return normed_output, normed_tmp_tgt

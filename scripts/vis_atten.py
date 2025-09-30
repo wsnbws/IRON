@@ -3,60 +3,72 @@ import matplotlib.pyplot as plt
 import cv2
 import os
 import glob
-from pathlib import Path
+from mmcv.utils import Config
+import argparse
 
-def visualize_attention_4frames(attn_weight, patch_idx, save_path, spatial_size=(32, 40), history_frames=4):
+def _load_vis_cfg(cfg_path=None):
+    """从配置文件读取可视化参数。
+    
+    优先使用命令行传入的 --config 路径；若未提供，则读取环境变量
+    VIS_ATTEN_CFG；仍未提供时回退到 '/home/wangshuo/otdr/configs/vis_atten.py'。
+    
+    期望的配置结构（两种之一）：
+    1) 直接在根上定义字段：npy_file, base_image_dir, patch_idx, frames,
+       spatial_h, spatial_w, output_root
+    2) 在 cfg.vis_atten 下面定义同名字段
     """
-    可视化指定patch对4个历史帧的注意力分数，使用统一颜色条
-    
-    Args:
-        attn_weight: 注意力权重 shape: (32*32*4,) 
-        patch_idx: patch索引
-        save_path: 保存路径
-        spatial_size: 空间尺寸 (H, W)
-        history_frames: 历史帧数量
-    """
-    h, w = spatial_size
-    
-    # 重塑为4帧格式 [4, H, W]
-    attn_frames = attn_weight.reshape(history_frames, h, w)
-    
-    # 计算patch位置
-    patch_x, patch_y = divmod(patch_idx, w)
-    
-    # 创建4帧可视化，统一颜色条
-    fig, axes = plt.subplots(1, history_frames, figsize=(16, 4))
-    
-    # 计算全局min/max用于统一颜色条
-    vmin, vmax = attn_frames.min(), attn_frames.max()
-    
-    for i in range(history_frames):
-        im = axes[i].imshow(attn_frames[i], cmap='viridis', vmin=vmin, vmax=vmax)
-        axes[i].set_title(f'Frame T-{history_frames-i}')
-        axes[i].set_xticks([])
-        axes[i].set_yticks([])
-        
-        # 标记最高注意力位置
-        max_pos = np.unravel_index(np.argmax(attn_frames[i]), attn_frames[i].shape)
-        axes[i].plot(max_pos[1], max_pos[0], 'r*', markersize=10)
-    
-    # 添加统一颜色条
-    # plt.colorbar(im, ax=axes, orientation='horizontal', pad=0.1, shrink=0.8)
-    
-    plt.suptitle(f'Attention from Patch {patch_idx} ({patch_x}, {patch_y})', fontsize=14)
-    plt.tight_layout()
-    
-    # 保存
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"Saved to: {save_path}")
+    default_cfg_path = cfg_path or os.environ.get('VIS_ATTEN_CFG', '/home/wangshuo/otdr/configs/vis_atten.py')
+    cfg_values = {}
+    if os.path.isfile(default_cfg_path):
+        try:
+            cfg_obj = Config.fromfile(default_cfg_path)
+            if isinstance(cfg_obj, dict) and 'vis_atten' in cfg_obj:
+                cfg_values = cfg_obj['vis_atten']
+            elif hasattr(cfg_obj, 'get'):
+                cfg_values = cfg_obj.get('vis_atten', cfg_obj)
+            else:
+                cfg_values = cfg_obj
+            print(f"Loaded config from: {default_cfg_path}")
+        except Exception as e:
+            print(f"Failed to load config '{default_cfg_path}': {e}. Using defaults.")
+    else:
+        print(f"Config file not found: {default_cfg_path}. Using defaults.")
+
+    # 回退默认值（与历史脚本一致）
+    defaults = {
+        'npy_file': "/home/wangshuo/otdr/out/atten_weights/1724315190.682787.jpg_cross_attn_weight_5.npy",
+        'base_image_dir': "/data20t/wangshuo/IR_Drivable/OTDR/test/images/xts_5",
+        'patch_idx': 795,
+        'frames': None,  # None 表示从数据推断
+        'spatial_h': 32,
+        'spatial_w': 40,
+        'output_root': "/home/wangshuo/otdr/out/atten_vis",
+    }
+
+    # 组装最终配置
+    def pick(key):
+        if isinstance(cfg_values, dict) and key in cfg_values:
+            return cfg_values[key]
+        try:
+            return getattr(cfg_values, key)
+        except Exception:
+            return defaults[key]
+
+    return {
+        'npy_file': pick('npy_file'),
+        'base_image_dir': pick('base_image_dir'),
+        'patch_idx': pick('patch_idx'),
+        'frames': pick('frames'),
+        'spatial_h': pick('spatial_h'),
+        'spatial_w': pick('spatial_w'),
+        'output_root': pick('output_root'),
+    }
 
 def extract_image_name(npy_file_path):
     """从.npy文件路径提取图片名称"""
     filename = os.path.basename(npy_file_path)
     # 移除 '_cross_attn_weight_3.npy' 后缀
-    image_name = filename.replace('_cross_attn_weight_3.npy', '')
+    image_name = filename.replace('_cross_attn_weight_5.npy', '')
     return image_name
 
 def find_image_path(image_name, base_dir):
@@ -141,7 +153,7 @@ def find_history_images(current_image_path, num_frames=4):
         print(f"Current image not found in directory: {current_image_path}")
         return []
 
-def create_attention_overlay(image_path, attention_map, save_path, alpha=0.6):
+def create_attention_overlay(image_path, attention_map, save_path, alpha=0.6, global_min=None, global_max=None):
     """创建注意力热图与原图的叠加"""
     if not os.path.exists(image_path):
         print(f"Image not found: {image_path}")
@@ -155,8 +167,15 @@ def create_attention_overlay(image_path, attention_map, save_path, alpha=0.6):
     # 将注意力图调整到原图尺寸
     attention_resized = cv2.resize(attention_map, (w_img, h_img))
     
-    # 归一化注意力图
-    attention_norm = (attention_resized - attention_resized.min()) / (attention_resized.max() - attention_resized.min())
+    # 使用全局归一化参数（如果提供）
+    if global_min is not None and global_max is not None:
+        attention_norm = (attention_resized - global_min) / (global_max - global_min)
+    else:
+        # 如果没有提供全局参数，使用局部归一化
+        attention_norm = (attention_resized - attention_resized.min()) / (attention_resized.max() - attention_resized.min())
+    
+    # 确保归一化值在[0,1]范围内
+    attention_norm = np.clip(attention_norm, 0, 1)
     
     # 创建热图
     heatmap = plt.cm.viridis(attention_norm)[:,:,:3]  # 去掉alpha通道
@@ -167,48 +186,82 @@ def create_attention_overlay(image_path, attention_map, save_path, alpha=0.6):
     
     # 保存
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    plt.figure(figsize=(8, 6))
-    plt.imshow(overlay)
-    plt.axis('off')
+    fig, ax = plt.subplots(figsize=(8, 6))
+    im = ax.imshow(overlay)
+    ax.axis('off')
+    
+    # 添加颜色条
+    if global_min is not None and global_max is not None:
+        # 创建颜色条映射
+        sm = plt.cm.ScalarMappable(cmap=plt.cm.viridis, 
+                                 norm=plt.Normalize(vmin=global_min, vmax=global_max))
+        sm.set_array([])
+        cbar = plt.colorbar(sm, ax=ax, orientation='horizontal', pad=0.1, shrink=0.8)
+        cbar.set_label('Attention Weight', fontsize=10)
+    
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"Attention overlay saved to: {save_path}")
 
 if __name__ == "__main__":
-    # 配置参数
-    patch_idx = 795
-    npy_file = "/public/home/wangshuo/DrivableTask/out/DrivableSeg/deform_atten/v3_2/atten_vis/saved_weights/20240822-xts-day-5-KAAtil_1724315343.083632.jpg_cross_attn_weight_3.npy"
-    image_name = extract_image_name(npy_file) 
+    # 仅接收配置文件路径的命令行参数
+    parser = argparse.ArgumentParser(description="Visualize attention using settings from a config file")
+    parser.add_argument('--config', '-c', type=str, required=True, help='Path to vis_atten config file')
+    _args = parser.parse_args()
+
+    # 从配置文件读取参数
+    cfg = _load_vis_cfg(_args.config)
+
+    patch_idx = int(cfg['patch_idx'])
+    npy_file = str(cfg['npy_file'])
+    image_name = extract_image_name(npy_file)
     print(f"Image name: {image_name}")
-    base_image_dir = "/public/home/public/IR_Drivable/baseline/images/test/xts_video/20240822-xts-day-5-KAAtil"
-    output_dir = f"/public/home/wangshuo/DrivableTask/out/DrivableSeg/deform_atten/v3_2/atten_vis/atten_maps/{os.path.splitext(image_name)[0]}/"
-    
+    base_image_dir = str(cfg['base_image_dir'])
+    output_dir = f"{cfg['output_root']}/{os.path.splitext(image_name)[0]}/"
+
     # 2. 找到对应的图片路径
     image_path = find_image_path(os.path.splitext(image_name)[0], base_image_dir)
     if not image_path:
         print(f"Image not found for: {image_name}")
-        exit()
+        exit(1)
     print(f"Found image: {image_path}")
-    
+
     # 3. 标注patch位置并保存
     annotated_save_path = f"{output_dir}/image_mark_{patch_idx}.png"
     annotate_patch_on_image(image_path, patch_idx, annotated_save_path)
-    
+
     # 4. 加载注意力权重
     attn_weight = np.load(npy_file)
     print(f"attn_weight.shape: {attn_weight.shape}")
-    patch_attn = attn_weight[0][0][patch_idx]  # (32*40*4)
-    
-    # 5. 重塑为4帧格式
-    attn_frames = patch_attn.reshape(4, 32, 40)
-    
-    # 6. 找到历史图片
-    history_images = find_history_images(image_path, 4)
+    patch_attn = attn_weight[0][0][patch_idx]
+
+    # 5. 根据配置/数据确定历史帧数并重塑
+    spatial_h, spatial_w = int(cfg['spatial_h']), int(cfg['spatial_w'])
+    per_frame_size = spatial_h * spatial_w
+    total_size = int(np.prod(patch_attn.shape))
+    if total_size % per_frame_size != 0:
+        print(f"Error: attention vector size {total_size} is not divisible by H*W={per_frame_size}.")
+        exit(1)
+    inferred_frames = total_size // per_frame_size
+    history_frames = int(cfg['frames']) if cfg['frames'] is not None else inferred_frames
+    if history_frames != inferred_frames:
+        print(f"Warning: frames={history_frames} does not match inferred {inferred_frames}. Using inferred value.")
+        history_frames = inferred_frames
+
+    attn_frames = patch_attn.reshape(history_frames, spatial_h, spatial_w)
+
+    # 6. 计算全局min/max用于统一归一化
+    global_min = attn_frames.min()
+    global_max = attn_frames.max()
+    print(f"Frames: {history_frames}, Spatial: ({spatial_h}, {spatial_w})")
+    print(f"Global attention range: [{global_min:.6f}, {global_max:.6f}]")
+
+    # 7. 找到历史图片
+    history_images = find_history_images(image_path, history_frames)
     print(f"Found {len(history_images)} history images")
-    
-    # 7. 创建注意力叠加图
+
+    # 8. 创建注意力叠加图（使用全局归一化）
     for i, (hist_img_path, attn_map) in enumerate(zip(history_images, attn_frames)):
-        overlay_save_path = f"{output_dir}/overlays/patch_{patch_idx}_frame_T-{4-i}_overlay.png"
-        create_attention_overlay(hist_img_path, attn_map, overlay_save_path)
-    
-    
+        overlay_save_path = f"{output_dir}/overlays/patch_{patch_idx}_frame_T-{history_frames - i}_overlay.png"
+        create_attention_overlay(hist_img_path, attn_map, overlay_save_path,
+                                 global_min=global_min, global_max=global_max)

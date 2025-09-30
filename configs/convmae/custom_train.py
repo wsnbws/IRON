@@ -2,11 +2,21 @@ _base_ = [
     '../_base_/models/upernet_video.py',
     '../_base_/datasets/drivable_video.py',
     '../_base_/default_runtime.py',
-    '../_base_/schedules/schedule_48k.py'
 ]
 
 crop_size = (512, 512)
 HISTORY_LENGTH = 4
+total_epochs = 40
+lr_config = dict(
+    warmup_ratio=1e-3,
+    warmup_iters=500,
+    warmlen_ratio=0.05
+)
+val_epoch = 1
+evaluation = dict(interval=200)
+# Batch size per GPU; note each sample is a clip of num_frames
+data = dict(samples_per_gpu=8, workers_per_gpu=2)
+
 model = dict(
     history_length=HISTORY_LENGTH,
     backbone=dict(
@@ -35,6 +45,8 @@ model = dict(
         detach_every=0,
         mask_ratio=4,
         history_length=HISTORY_LENGTH,
+        use_topk_memory=True,
+        topk_memory_size=256
     ),
 
     # auxiliary_head=dict(
@@ -51,7 +63,6 @@ model = dict(
 
 
 optimizer = dict(
-    _delete_=True,
     type='AdamW',
     lr=1e-4,
     betas=(0.9, 0.999),
@@ -59,11 +70,6 @@ optimizer = dict(
     constructor='LayerDecayOptimizerConstructor',
     paramwise_cfg=dict(num_layers=11, layer_decay_rate=0.75)
 )
-
-
-# Batch size per GPU; note each sample is a clip of num_frames
-data = dict(samples_per_gpu=8, workers_per_gpu=2)
-val_epoch = 2
 
 # do not use mmdet version fp16 
 fp16 = None

@@ -14,6 +14,76 @@ from .position_embed import PositionEmbeddingSine
 from .history_queue import TemporalQueue
 from .untils import LayerNorm2d
 
+
+class PSPModule(nn.Module):
+    """Pyramid Scene Parsing Module
+    
+    Args:
+        in_channels (int): Input channels
+        out_channels (int): Output channels  
+        pool_scales (tuple): Pooling scales for pyramid pooling
+    """
+    def __init__(self, in_channels, out_channels, pool_scales=(1, 2, 3, 6)):
+        super(PSPModule, self).__init__()
+        self.pool_scales = pool_scales
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        
+        # Pyramid pooling branches
+        self.psp_modules = nn.ModuleList()
+        for scale in pool_scales:
+            self.psp_modules.append(
+                nn.Sequential(
+                    nn.AdaptiveAvgPool2d(scale),
+                    nn.Conv2d(in_channels, in_channels // len(pool_scales), kernel_size=1, bias=False),
+                    nn.BatchNorm2d(in_channels // len(pool_scales)),
+                    nn.ReLU(inplace=True)
+                )
+            )
+        
+        # Final conv to adjust channels
+        self.final_conv = nn.Sequential(
+            nn.Conv2d(
+                in_channels + len(pool_scales) * (in_channels // len(pool_scales)), 
+                out_channels, 
+                kernel_size=3, 
+                padding=1, 
+                bias=False
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+    def forward(self, x):
+        """Forward pass of PSP module
+        
+        Args:
+            x (Tensor): Input feature tensor of shape (B, C, H, W)
+            
+        Returns:
+            Tensor: Enhanced feature tensor of shape (B, out_channels, H, W)
+        """
+        input_size = x.size()
+        psp_outs = [x]
+        
+        for psp_module in self.psp_modules:
+            psp_out = psp_module(x)
+            psp_out = F.interpolate(
+                psp_out, 
+                size=input_size[2:], 
+                mode='bilinear', 
+                align_corners=False
+            )
+            psp_outs.append(psp_out)
+        
+        # Concatenate all pyramid features
+        psp_outs = torch.cat(psp_outs, dim=1)
+        
+        # Final convolution to get desired output channels
+        output = self.final_conv(psp_outs)
+        
+        return output
+
 @HEADS.register_module()
 class PredictiveTemporalUPerHead(BaseDecodeHead):
     """
@@ -27,6 +97,10 @@ class PredictiveTemporalUPerHead(BaseDecodeHead):
         self.detach_every = int(kwargs.pop('detach_every', 0))
         self.history_length = int(kwargs.pop('history_length', 2))  # Configurable history length
         self.mask_ratio = int(kwargs.pop('mask_ratio', 8))
+        
+        # Top-K foreground selection configuration
+        self.use_topk_memory = bool(kwargs.pop('use_topk_memory', False))  # 是否启用Top-K选择
+        self.topk_memory_size = int(kwargs.pop('topk_memory_size', 256))   # Top-K的K值
         super(PredictiveTemporalUPerHead, self).__init__(
             input_transform='multiple_select', **kwargs)
 
@@ -47,6 +121,13 @@ class PredictiveTemporalUPerHead(BaseDecodeHead):
             scale=None,
             temperature=10000
         )
+        
+        # PSP module for enhanced semantic perception
+        self.psp_module = PSPModule(
+            in_channels=self.channels,
+            out_channels=self.channels,
+            pool_scales=(1, 2, 3, 6)
+        )
         # time embedding: simple MLP mapping scalar timestamp -> channel embedding
         self.time_mlp = nn.Sequential(
             nn.Linear(1, 128),
@@ -66,6 +147,18 @@ class PredictiveTemporalUPerHead(BaseDecodeHead):
                 self.channels, self.channels, kernel_size=2, stride=2
             ),
             nn.GELU(),
+        )
+
+        self.hist_upscaling = nn.Sequential(
+            nn.ConvTranspose2d(
+                self.channels, self.channels, kernel_size=2, stride=2
+            ),
+            nn.GELU(),
+            nn.ConvTranspose2d(
+                self.channels, self.channels, kernel_size=2, stride=2
+            ),
+            nn.GELU(),
+            nn.Conv2d(self.channels, self.num_classes, kernel_size=3, padding=1)
         )
 
    
@@ -152,13 +245,75 @@ class PredictiveTemporalUPerHead(BaseDecodeHead):
         mem_features = batch_memory_output["vision_features"]  # (T*B, C, H, W)
         batch_pos_enc = batch_memory_output["vision_pos_enc"]    # (T*B, C, H, W)
         batch_pos_enc = batch_pos_enc + batch_time_enc
-        batch_pos_enc = batch_pos_enc.view(-1, B, *batch_pos_enc.shape[1:]) #(T, B, C, H, W)
-        memory_enc = batch_pos_enc.permute(0, 3, 4, 1, 2).flatten(0, 2) #(T*H*W, B,C)
         
-        mem_features = mem_features.view(-1, B, *mem_features.shape[1:])
-        mem_features = mem_features.permute(0, 3, 4, 1, 2).flatten(0, 2)
-
+        # 根据配置决定是否使用Top-K前景选择
+        if self.use_topk_memory:
+            # 使用Top-K选择前景memory tokens
+            if self.training:
+                selected_memory, selected_pos_enc = self._select_topk_foreground_memory(
+                    mem_features, batch_pos_enc, batch_masks, k=self.topk_memory_size
+                )
+            else:
+                selected_memory, selected_pos_enc = self._select_topk_foreground_memory(
+                    mem_features, batch_pos_enc, batch_masks, k=320
+                )
+            # 转换为attention所需的格式: (S, B, C)
+            k_tokens = selected_memory.shape[0] // (len(historical_frames) * B)  # 每个样本的token数
+            memory_enc = selected_pos_enc.view(len(historical_frames), B, k_tokens, -1).permute(0, 2, 1, 3).flatten(0, 1)  # (T*k, B, C)
+            mem_features = selected_memory.view(len(historical_frames), B, k_tokens, -1).permute(0, 2, 1, 3).flatten(0, 1)  # (T*k, B, C)
+        else:
+            # 使用原始的全图memory tokens (向后兼容)
+            batch_pos_enc = batch_pos_enc.view(-1, B, *batch_pos_enc.shape[1:]) #(T, B, C, H, W)
+            memory_enc = batch_pos_enc.permute(0, 3, 4, 1, 2).flatten(0, 2) #(T*H*W, B,C)
+            
+            mem_features = mem_features.view(-1, B, *mem_features.shape[1:])
+            mem_features = mem_features.permute(0, 3, 4, 1, 2).flatten(0, 2)
         return memory_enc, mem_features
+
+    def _select_topk_foreground_memory(self, mem_features, batch_pos_enc, batch_masks, k=256):
+        """
+        基于masks选择Top-K前景memory tokens (完全向量化版本)
+        
+        Args:
+            mem_features: (T*B, C, H, W) - 历史帧特征
+            batch_pos_enc: (T*B, C, H, W) - 位置编码
+            batch_masks: (T*B, num_classes-1, H_mask, W_mask) - 分割掩码
+            k: 每个样本选择的token数量
+            
+        Returns:
+            selected_memory: (T*B*k, C) - 选择的memory特征
+            selected_pos_enc: (T*B*k, C) - 对应的位置编码
+        """
+        TB, C, H, W = mem_features.shape
+        
+        # 将mask下采样到特征图尺寸并求和得到前景概率
+        masks_resized = F.interpolate(
+            batch_masks.sum(dim=1, keepdim=True),  # (T*B, 1, H_mask, W_mask)
+            size=(H, W), 
+            mode='bilinear', 
+            align_corners=False
+        ).squeeze(1)  # (T*B, H, W)
+        
+        # 展平空间维度
+        masks_flat = masks_resized.view(TB, H*W)  # (T*B, H*W)
+        mem_flat = mem_features.view(TB, C, H*W)  # (T*B, C, H*W)
+        pos_flat = batch_pos_enc.view(TB, C, H*W)  # (T*B, C, H*W)
+        
+        # 向量化的Top-K选择
+        _, topk_indices = torch.topk(masks_flat, k=min(k, H*W), dim=1)  # (T*B, k)
+        
+        # 使用gather选择对应的特征和位置编码
+        # 扩展indices以匹配特征维度
+        topk_indices_expanded = topk_indices.unsqueeze(1).expand(-1, C, -1)  # (T*B, C, k)
+        
+        selected_memory = torch.gather(mem_flat, 2, topk_indices_expanded)  # (T*B, C, k)
+        selected_pos_enc = torch.gather(pos_flat, 2, topk_indices_expanded)  # (T*B, C, k)
+        
+        # 转换为所需格式
+        selected_memory = selected_memory.transpose(1, 2).reshape(TB*k, C)  # (T*B*k, C)
+        selected_pos_enc = selected_pos_enc.transpose(1, 2).reshape(TB*k, C)  # (T*B*k, C)
+        
+        return selected_memory, selected_pos_enc
 
     def _forward_stream_batch(self, inputs, t: int, timestamps: torch.Tensor = None, **kargs):
         """Streaming forward for a batch of single-frame features using per-slot memory.
@@ -176,28 +331,34 @@ class PredictiveTemporalUPerHead(BaseDecodeHead):
         fpn_outs = self._fpn_forward_single(inputs)
         if len(fpn_outs) > 1:
             cur_features = fpn_outs[-1]  # (B, 768, 32, 32)
+        
+        # Apply PSP module for enhanced semantic perception
+        cur_features = self.psp_module(cur_features)  # (B, C, H, W)
+        
         B, C, H, W = cur_features.shape 
         
-        cur_features = self._corrupt_current_features(cur_features)
+        # cur_features = self._corrupt_current_features(cur_features)
         cur_pos_enc = self.pos_embed(cur_features)  # (B, C, H, W)
         cur_features_seq = cur_features.flatten(2).permute(2, 0, 1)  # (S, B, C)
         cur_pos_enc_seq = cur_pos_enc.flatten(2).permute(2, 0, 1)
     
         memory_enc, mem_features = self._get_memory(cur_features, t, timestamps)
         
-        fus_feat = self.memory_attention(cur_features_seq, mem_features, cur_pos_enc_seq, memory_enc, spatial_shape=(H, W), **kargs)
+        fus_feat, hist_feat = self.memory_attention(cur_features_seq, mem_features, cur_pos_enc_seq, memory_enc, spatial_shape=(H, W), **kargs)
         fus_feat = fus_feat.permute(1, 2, 0).reshape(B, C, H, W)  # (bs, c, h, w)
+        hist_feat = hist_feat.permute(1, 2, 0).reshape(B, C, H, W)
 
         dc1, ln1, act1, dc2, act2 = self.output_upscaling
         feat_s0, feat_s1 = fpn_outs[0], fpn_outs[1]
-        upscaled_embedding = act1(ln1(dc1(fus_feat) + 0*feat_s1))
-        upscaled_embedding = act2(dc2(upscaled_embedding) + 0*feat_s0)
+        upscaled_embedding = act1(ln1(dc1(fus_feat) + 0 * feat_s1))
+        upscaled_embedding = act2(dc2(upscaled_embedding) + 0* feat_s0)
         final_output = self.cls_seg(upscaled_embedding)
+        hist_output = self.hist_upscaling(hist_feat)
 
         # Update queues: keep pure current features and final outputs
         self.temporal_queue.push(cur_features, final_output[:,-1:,:,:])
 
-        return final_output
+        return final_output, hist_output
 
     def _corrupt_current_features(self, features: torch.Tensor) -> torch.Tensor:
 
@@ -243,7 +404,7 @@ class PredictiveTemporalUPerHead(BaseDecodeHead):
                     self.temporal_time_test_queue[i] = cur_timestamp
 
         ts_tensor = torch.tensor([self.temporal_time_test_queue], dtype=torch.float32)
-        final_output = self._forward_stream_batch(inputs, t_val, timestamps=ts_tensor, basename = basename)
+        final_output, _ = self._forward_stream_batch(inputs, t_val, timestamps=ts_tensor, basename = basename)
         return final_output
     
     def forward_train(self, inputs, img_metas, gt_semantic_seg, t=0, timestamps: torch.Tensor = None,):
@@ -252,9 +413,12 @@ class PredictiveTemporalUPerHead(BaseDecodeHead):
         Computes losses for both M1 and final outputs using the base ``losses``.
         """
         # Streaming path: inputs contain only current frame features (B, ...)
-        final_output = self._forward_stream_batch(inputs, t, timestamps=timestamps)
+        final_output, hist_output = self._forward_stream_batch(inputs, t, timestamps=timestamps)
         loss_final = self.losses(final_output, gt_semantic_seg)
+        loss_hist = self.losses(hist_output, gt_semantic_seg)
         losses = {}
         for key, value in loss_final.items():
             losses[f'{key}_final'] = value
+        for key, value in loss_hist.items():
+            losses[f'{key}_hist'] = value
         return losses
