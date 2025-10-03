@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 import re
+from typing import Optional, Tuple
 
 from mmseg.ops import resize
 from mmseg.models.builder import HEADS
@@ -13,6 +14,11 @@ from .memory_attention import MemoryAttention
 from .position_embed import PositionEmbeddingSine
 from .history_queue import TemporalQueue
 from .untils import LayerNorm2d
+from .point_predictor import PointPredictor
+from .loss import PointPredictionLoss
+from .sam.prompt_encoder import PromptEncoder
+from .sam.mask_decoder import MaskDecoder
+from .sam.transformer import TwoWayTransformer
 
 
 class PSPModule(nn.Module):
@@ -160,6 +166,35 @@ class PredictiveTemporalUPerHead(BaseDecodeHead):
             nn.GELU(),
             nn.Conv2d(self.channels, self.num_classes, kernel_size=3, padding=1)
         )
+
+        # Point prediction modules
+        self.point_predictor = PointPredictor(
+            current_dim=self.channels,
+            memory_dim=64,
+            num_points=1,
+            hidden_dim=512,
+            num_heads=4,
+            use_topk_features=True,
+            topk_size=64,
+        )
+        self.point_loss = PointPredictionLoss(
+            cls_weight=1.0,
+            reg_weight=1.0,
+            normalize_by_image_size=True,
+            min_area_ratio=0.0,
+        )
+        self.point_prompt_threshold = 0.5
+
+        # Prompt encoder and mask decoder will be lazily initialized
+        self.prompt_encoder: Optional[PromptEncoder] = None
+        self.mask_decoder: Optional[MaskDecoder] = None
+        self.prompt_two_way_transformer: Optional[TwoWayTransformer] = None
+
+        # Debug hooks for downstream use
+        self.last_point_logits: Optional[torch.Tensor] = None
+        self.last_point_probs: Optional[torch.Tensor] = None
+        self.last_pred_points: Optional[torch.Tensor] = None
+        self.last_prompt_masks: Optional[torch.Tensor] = None
 
    
     def _build_fpn_module(self):
@@ -348,17 +383,32 @@ class PredictiveTemporalUPerHead(BaseDecodeHead):
         fus_feat = fus_feat.permute(1, 2, 0).reshape(B, C, H, W)  # (bs, c, h, w)
         hist_feat = hist_feat.permute(1, 2, 0).reshape(B, C, H, W)
 
-        dc1, ln1, act1, dc2, act2 = self.output_upscaling
-        feat_s0, feat_s1 = fpn_outs[0], fpn_outs[1]
-        upscaled_embedding = act1(ln1(dc1(fus_feat) + 0 * feat_s1))
-        upscaled_embedding = act2(dc2(upscaled_embedding) + 0* feat_s0)
-        final_output = self.cls_seg(upscaled_embedding)
-        hist_output = self.hist_upscaling(hist_feat)
+        # Point prediction and prompt generation
+        has_point_logits, pred_points = self.point_predictor(
+            cur_features=cur_features,
+            mem_features=mem_features,
+            memory_pos_enc=memory_enc,
+            image_size=(512, 512),
+        )
+        sparse_prompt_embeddings, dense_prompt_embeddings = self.prompt_encoder(
+            pred_points, has_point_logits, confidence_is_logit=True
+        )
+        sparse_prompt_embeddings = sparse_prompt_embeddings.to(fus_feat.device, fus_feat.dtype)
+        dense_prompt_embeddings = dense_prompt_embeddings.to(fus_feat.device, fus_feat.dtype)
+
+        masks = self.mask_decoder(
+            image_embeddings=fus_feat,
+            image_pe=cur_pos_enc,
+            sparse_prompt_embeddings=sparse_prompt_embeddings,
+            dense_prompt_embeddings=dense_prompt_embeddings,
+        )
+
+        self.last_prompt_masks = masks.detach()
 
         # Update queues: keep pure current features and final outputs
         self.temporal_queue.push(cur_features, final_output[:,-1:,:,:])
 
-        return final_output, hist_output
+        return final_output, hist_output, has_point_logits, pred_points, masks, use_point_mask
 
     def _corrupt_current_features(self, features: torch.Tensor) -> torch.Tensor:
 
@@ -413,12 +463,22 @@ class PredictiveTemporalUPerHead(BaseDecodeHead):
         Computes losses for both M1 and final outputs using the base ``losses``.
         """
         # Streaming path: inputs contain only current frame features (B, ...)
-        final_output, hist_output = self._forward_stream_batch(inputs, t, timestamps=timestamps)
+        final_output, hist_output, has_point_logits, pred_points, _, _ = self._forward_stream_batch(inputs, t, timestamps=timestamps)
         loss_final = self.losses(final_output, gt_semantic_seg)
         loss_hist = self.losses(hist_output, gt_semantic_seg)
+        loss_point_total, loss_point_cls, loss_point_reg, point_targets = self.point_loss(
+            pred_has_point=has_point_logits,
+            pred_points=pred_points,
+            gt_semantic_seg=gt_semantic_seg,
+            target_class=1,
+        )
         losses = {}
         for key, value in loss_final.items():
             losses[f'{key}_final'] = value
         for key, value in loss_hist.items():
             losses[f'{key}_hist'] = value
+        losses['loss_point'] = loss_point_total
+        losses['loss_point_cls'] = loss_point_cls
+        losses['loss_point_reg'] = loss_point_reg
+        losses['point_targets'] = point_targets.mean()
         return losses
