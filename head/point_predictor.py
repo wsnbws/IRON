@@ -28,7 +28,7 @@ class PointPredictor(nn.Module):
         num_points: int = 1,
         hidden_dim: int = 512,
         num_heads: int = 4,
-        topk_size: int = 64,
+        topk_size: int = 256,
         num_agg_tokens: int = 1, 
         num_self_attn_layers: int = 3,  
         max_history_frames: int = 4, 
@@ -85,15 +85,15 @@ class PointPredictor(nn.Module):
         
         self.confidence_head = nn.Sequential(
             nn.Linear(self.unified_dim, hidden_dim // 2),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_dim // 2, 1),
+            nn.Linear(hidden_dim // 2, num_points),
             nn.Sigmoid()
         )
         
         self.point_regressor = nn.Sequential(
             nn.Linear(self.unified_dim, hidden_dim),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, num_points * 2),  # num_points个点，每个点2个坐标
             nn.Sigmoid() 
@@ -189,7 +189,7 @@ class PointPredictor(nn.Module):
             
         Returns:
             final_global_token: (B, unified_dim) - 最终的单个全局token
-            confidence: (B,) - 置信度分数，范围[0, 1]
+            confidence: (B, num_points) - 置信度分数, sigmoid [0, 1]
             points: (B, num_points, 2) - 预测的点坐标，范围[0, 1]或像素坐标
         """
         B = cur_features.shape[0]
@@ -200,11 +200,11 @@ class PointPredictor(nn.Module):
         combined_tokens = torch.cat([current_global_tokens, memory_global_tokens], dim=1).flatten(1)  # (B, (num_agg_tokens + T*num_agg_tokens)*unified_dim)
         final_global_token = self.final_norm(combined_tokens + self.final_mlp(self.norm1(combined_tokens)))  # (B, unified_dim)
 
-        confidence = self.confidence_head(final_global_token).squeeze(-1)
+        confidence = self.confidence_head(final_global_token)
         points_flat = self.point_regressor(final_global_token)  # (B, num_points * 2)
         points = points_flat.view(B, self.num_points, 2)  # (B, num_points, 2)
         points = points * torch.tensor(list(self.image_size), device=points.device, dtype=points.dtype)
         
-        return final_global_token, confidence, points  # (B, unified_dim), (B,), (B, num_points, 2)
+        return final_global_token, confidence, points  # (B, unified_dim), (B, num_points), (B, num_points, 2)
 
 

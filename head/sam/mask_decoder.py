@@ -5,13 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 
 from typing import List, Optional, Tuple, Type
-
 import torch
 from torch import nn
-
 from head.untils import LayerNorm2d, MLP
-
-
 class MaskDecoder(nn.Module):
     def __init__(
         self,
@@ -51,15 +47,7 @@ class MaskDecoder(nn.Module):
             activation(),
         )
         self.use_high_res_features = use_high_res_features
-        if use_high_res_features:
-            self.conv_s0 = nn.Conv2d(
-                transformer_dim, transformer_dim // 8, kernel_size=1, stride=1
-            )
-            self.conv_s1 = nn.Conv2d(
-                transformer_dim, transformer_dim // 4, kernel_size=1, stride=1
-            )
-
-        # Single mask hypernetwork
+        
         self.output_hypernetwork_mlp = MLP(
             transformer_dim, transformer_dim, transformer_dim // 8, 3
         )
@@ -69,7 +57,7 @@ class MaskDecoder(nn.Module):
         image_embeddings: torch.Tensor,
         image_pe: torch.Tensor,
         sparse_prompt_embeddings: torch.Tensor,
-        dense_prompt_embeddings: torch.Tensor,
+        hist_cont_prompt_embeddings: torch.Tensor,
         high_res_features: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
         """
@@ -79,32 +67,21 @@ class MaskDecoder(nn.Module):
           image_embeddings (torch.Tensor): the embeddings from the image encoder (B, C, H, W)
           image_pe (torch.Tensor): positional encoding with the shape of image_embeddings (1, C, H, W)
           sparse_prompt_embeddings (torch.Tensor): the embeddings of the points (B, N, C)
-          dense_prompt_embeddings (torch.Tensor): the dense embeddings (B, C, H, W)
           high_res_features (Optional[List[torch.Tensor]]): high-res features for upsampling
 
         Returns:
           torch.Tensor: predicted mask (B, 1, H, W)
         """
         B = sparse_prompt_embeddings.size(0)
-        
-        # Use only mask token
-        output_tokens = self.mask_token.weight.unsqueeze(0).expand(B, -1, -1)  # (B, 1, C)
-        tokens = torch.cat((output_tokens, sparse_prompt_embeddings), dim=1)  # (B, 1+N, C)
+        src, pos_src= image_embeddings, image_pe
 
-        # Prepare image embeddings
-        assert image_embeddings.shape[0] == B, f"Batch size mismatch: image_embeddings={image_embeddings.shape[0]}, prompts={B}"
-        src = image_embeddings + dense_prompt_embeddings
-        
-        assert image_pe.size(0) == 1, "image_pe should have size 1 in batch dim (from `get_dense_pe()`)"
-        pos_src = image_pe.expand(B, -1, -1, -1)  # (1, C, H, W) -> (B, C, H, W)
+        output_tokens = self.mask_token.weight.unsqueeze(0).expand(B, -1, -1)  # (B, 1, C)
+        tokens = torch.cat((output_tokens, sparse_prompt_embeddings, hist_cont_prompt_embeddings), dim=1)  # (B, 1+N+M, C)
         b, c, h, w = src.shape
 
-        # Run the transformer
         hs, src = self.transformer(src, pos_src, tokens)
-        mask_token_out = hs[:, 0, :]  # (B, C) - only mask token
-
-        # Upscale mask embeddings and predict masks using the mask token
-        src = src.transpose(1, 2).view(b, c, h, w)
+        mask_token_out = hs[:, 0, :]               # (B, C)
+        src = src.transpose(1, 2).view(b, c, h, w) # (B, C, H, W)
         if not self.use_high_res_features:
             upscaled_embedding = self.output_upscaling(src)
         else:
