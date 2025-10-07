@@ -12,7 +12,9 @@ from .memory_encoder import MemoryEncoder
 from .memory_attention import MemoryAttention
 from .position_embed import PositionEmbeddingSine
 from .history_queue import TemporalQueue
-from .untils import LayerNorm2d
+from .untils import (LayerNorm2d, init_conv_module_weights, init_psp_weights, 
+                     init_mlp_weights, init_attention_weights, init_encoder_weights,
+                     init_predictor_weights, init_sam_weights)
 from .point_predictor import PointPredictor
 from .loss import otdr_loss
 from .sam.prompt_encoder import PromptEncoder
@@ -154,8 +156,9 @@ class PredictiveTemporalUPerHead(nn.Module):
         self.mask_ratio = int(kwargs.get('mask_ratio', 8))  # Mask downsampling ratio
         
         # Memory selection configuration
-        self.use_topk_memory = bool(kwargs.get('use_topk_memory', False))  # Enable top-K memory selection
+        self.use_topk_memory = bool(kwargs.get('use_topk_memory', True))  # Enable top-K memory selection
         self.topk_memory_size = int(kwargs.get('topk_memory_size', 256))  # Top-K memory token count
+        self.test_topk_memory_size = int(kwargs.get('test_topk_memory_size', 320))  # Top-K memory token count for test
 
         # ===== Core Components Initialization =====
         
@@ -203,8 +206,8 @@ class PredictiveTemporalUPerHead(nn.Module):
             num_points=1,  # Number of points to predict per object
             hidden_dim=512,  # Hidden layer dimension
             num_heads=4,  # Number of attention heads
-            use_topk_features=True,  # Use top-K feature selection
             topk_size=self.topk_memory_size,  # Top-K selection size
+            hist_queue_length=self.history_length,  # Align T with predictor
         )
 
         # Build SAM-style decoder components
@@ -215,10 +218,45 @@ class PredictiveTemporalUPerHead(nn.Module):
             cls_weight=1.0,  # Weight for point classification loss
             reg_weight=1.0,  # Weight for point regression loss
             seg_weight=1.0,  # Weight for mask segmentation loss
-            normalize_by_image_size=True,  # Normalize coordinates by image size
+            normalize_by_image_size=False,  # Normalize coordinates by image size
             min_area_ratio=0.0,  # Minimum area ratio for valid targets
         )
         self.point_prompt_threshold = 0.5  # Confidence threshold for point prompts
+
+    def init_weights(self):
+        """Initialize weights for all components using utils functions."""
+        # Initialize FPN convolutions
+        for m in self.lateral_convs:
+            init_conv_module_weights(m)
+        for m in self.fpn_convs:
+            init_conv_module_weights(m)
+
+        # Initialize PSP module
+        init_psp_weights(self.psp_module)
+        
+        # Initialize temporal MLP
+        init_mlp_weights(self.time_mlp)
+        
+        # Initialize memory attention
+        if hasattr(self.memory_attention, 'init_weights'):
+            self.memory_attention.init_weights()
+        else:
+            init_attention_weights(self.memory_attention)
+            
+        # Initialize memory encoder
+        if hasattr(self.memory_encoder, 'init_weights'):
+            self.memory_encoder.init_weights()
+        else:
+            init_encoder_weights(self.memory_encoder)
+            
+        # Initialize point predictor
+        if hasattr(self.point_predictor, 'init_weights'):
+            self.point_predictor.init_weights()
+        else:
+            init_predictor_weights(self.point_predictor)
+            
+        # Initialize SAM components
+        init_sam_weights(self.prompt_encoder, self.mask_decoder)
 
     def _build_sam_decoder(self):
         """
@@ -239,8 +277,8 @@ class PredictiveTemporalUPerHead(nn.Module):
             embed_dim=self.sam_prompt_embed_dim,  # Embedding dimension
             image_embedding_size=self.sam_prompt_image_embedding_size,  # Feature map size
             input_image_size=self.sam_prompt_input_image_size,  # Input image resolution
-            image_embedding_size_test=self.sam_prompt_test_image_embedding_size,  # Test feature size
-            input_image_size_test=self.sam_prompt_test_image_size  # Test image resolution
+            test_image_embedding_size=self.sam_prompt_test_image_embedding_size,  # Test feature size
+            test_input_image_size=self.sam_prompt_test_image_size  # Test image resolution
         )
         
         # Mask decoder: generates segmentation masks from features and prompts
@@ -424,7 +462,7 @@ class PredictiveTemporalUPerHead(nn.Module):
         # Select memory tokens based on configuration
         if self.use_topk_memory:
             # Use top-K foreground selection for efficient memory usage
-            k_size = self.topk_memory_size if self.training else 320  # Different K for train/test
+            k_size = self.topk_memory_size if self.training else self.test_topk_memory_size  # Different K for train/test
             selected_memory, selected_pos_enc = self._select_topk_foreground_memory(
                 mem_features, batch_pos_enc, batch_masks, k=k_size
             )
@@ -444,6 +482,70 @@ class PredictiveTemporalUPerHead(nn.Module):
             mem_features = mem_features.view(-1, B, *mem_features.shape[1:])  # (T, B, C, H, W)
             mem_features = mem_features.permute(0, 3, 4, 1, 2).flatten(0, 2)  # (T*H*W, B, C)
             
+        return memory_enc, mem_features
+
+    def _get_memory_base(self, cur_features, t=0, timestamps: torch.Tensor = None):
+        """Get base memory features before formatting (shared computation)."""
+        B, C, H, W = cur_features.shape
+        mask_shape = (self.num_classes - 1, H * self.mask_ratio, W * self.mask_ratio)
+        self.temporal_queue.ensure_allocation(cur_features, mask_shape)
+        
+        if int(t) == 0:
+            self.temporal_queue.reset_state(all_batch=True)
+
+        historical_frames, historical_masks = self.temporal_queue.get_history_frames()
+        batch_frames = historical_frames.view(-1, *historical_frames.shape[2:])
+        batch_masks = historical_masks.view(-1, *historical_masks.shape[2:])
+
+        # Process temporal encoding
+        timestamps = timestamps.to(cur_features.device, dtype=cur_features.dtype)
+        tmin = timestamps.min(dim=1, keepdim=True)[0]
+        tmax = timestamps.max(dim=1, keepdim=True)[0]
+        denom = (tmax - tmin).clamp_min(1e-6)
+        timestamps = (timestamps - tmin) / denom
+        
+        historical_timestamps = timestamps[:, :-1].transpose(0, 1)
+        batch_timestamps = historical_timestamps.reshape(-1, 1)
+        batch_time_enc = self.time_mlp(batch_timestamps)
+        batch_time_enc = batch_time_enc.unsqueeze(2).unsqueeze(3)
+        batch_time_enc = batch_time_enc.expand(-1, -1, *historical_frames.shape[3:])
+
+        # Encode memory features
+        batch_memory_output = self.memory_encoder(batch_frames, batch_masks)
+        mem_features = batch_memory_output["vision_features"]
+        batch_pos_enc = batch_memory_output["vision_pos_enc"]
+        batch_pos_enc = batch_pos_enc + batch_time_enc
+        
+        return mem_features, batch_pos_enc, batch_masks
+
+    def _format_memory_full(self, mem_features, batch_pos_enc, B):
+        """Format base memory as full spatial memory for attention."""
+        # Use all spatial locations (T*H*W, B, C)
+        batch_pos_enc = batch_pos_enc.view(-1, B, *batch_pos_enc.shape[1:])
+        memory_enc = batch_pos_enc.permute(0, 3, 4, 1, 2).flatten(0, 2)
+        
+        mem_features = mem_features.view(-1, B, *mem_features.shape[1:])
+        mem_features = mem_features.permute(0, 3, 4, 1, 2).flatten(0, 2)
+        
+        return memory_enc, mem_features
+
+    def _format_memory_topk(self, mem_features, batch_pos_enc, batch_masks, B):
+        """Format base memory as topk memory for point prediction."""
+        k_size = self.topk_memory_size if self.training else 320
+        selected_memory, selected_pos_enc = self._select_topk_foreground_memory(
+            mem_features, batch_pos_enc, batch_masks, k=k_size
+        )
+        
+        # Calculate history length from batch size
+        history_len = mem_features.shape[0] // B
+        k_tokens = selected_memory.shape[0] // (history_len * B)
+        
+        memory_enc = selected_pos_enc.view(history_len, B, k_tokens, -1)
+        memory_enc = memory_enc.permute(0, 2, 1, 3).flatten(0, 1)
+        
+        mem_features = selected_memory.view(history_len, B, k_tokens, -1)
+        mem_features = mem_features.permute(0, 2, 1, 3).flatten(0, 1)
+        
         return memory_enc, mem_features
 
     def _select_topk_foreground_memory(self, mem_features, batch_pos_enc, batch_masks, k=256):
@@ -539,25 +641,31 @@ class PredictiveTemporalUPerHead(nn.Module):
         cur_features_seq = cur_features.flatten(2).permute(2, 0, 1)  # (H*W, B, C)
         cur_pos_enc_seq = cur_pos_enc.flatten(2).permute(2, 0, 1)  # (H*W, B, C)
     
-        # Step 5: Retrieve and process historical memory
-        memory_enc, mem_features = self._get_memory(cur_features, t, timestamps)
+        # Step 5: Get base memory features (shared computation)
+        base_mem_features, base_pos_enc, batch_masks = self._get_memory_base(cur_features, t, timestamps)
 
-        # Step 6: Fuse current features with historical context via attention
+        # Step 6: Format memory for attention (full memory)
+        memory_enc_full, mem_features_full = self._format_memory_full(base_mem_features, base_pos_enc, B)
+        
+        # Fuse current features with historical context via attention (use full memory)
         fus_feat, _ = self.memory_attention(
             cur_features_seq,  # Current frame queries: (H*W, B, C)
-            mem_features,  # Historical memory keys/values: (T*K, B, C) or (T*H*W, B, C)
+            mem_features_full,  # Full historical memory: (T*H*W, B, C)
             cur_pos_enc_seq,  # Current position encodings: (H*W, B, C)
-            memory_enc,  # Memory position encodings: (T*K, B, C) or (T*H*W, B, C)
+            memory_enc_full,  # Full memory position encodings: (T*H*W, B, C)
             spatial_shape=(H, W),  # Spatial dimensions for RoPE
             **kargs
         )
         fus_feat = fus_feat.permute(1, 2, 0).reshape(B, C, H, W)  # Reshape back: (B, C, H, W)
 
-        # Step 7: Predict segmentation points and confidence
+        # Step 7: Format memory for point prediction (topk memory)
+        memory_enc_topk, mem_features_topk = self._format_memory_topk(base_mem_features, base_pos_enc, batch_masks, B)
+        
+        # Predict segmentation points and confidence (use topk memory)
         final_global_token, confidence, points = self.point_predictor.forward(
             cur_features=cur_features,  # Current frame features: (B, C, H, W)
-            mem_features=mem_features,  # Memory features: (T*K, B, C) or (T*H*W, B, C)
-            memory_pos_enc=memory_enc  # Memory position encodings: (T*K, B, C) or (T*H*W, B, C)
+            mem_features=mem_features_topk,  # TopK memory features: (T*K, B, C)
+            cur_pos_enc=cur_pos_enc 
         )
         
         # Step 8: Encode predicted points as prompts
@@ -570,7 +678,7 @@ class PredictiveTemporalUPerHead(nn.Module):
             image_pe=self.prompt_encoder.get_dense_pe(),  # Dense position encodings: (1, C, H, W)
             sparse_prompt_embeddings=sparse_prompt_embeddings,  # Point prompts: (B, N, C)
             hist_cont_prompt_embeddings=final_global_token,  # Historical context: (B, 1, C)
-            high_res_features=[]  # High-resolution features (empty for now)
+            high_res_features=fpn_outs[:-1]  # High-resolution features (empty for now)
         )
 
         # Step 10: Update temporal queue with current results
@@ -665,18 +773,12 @@ class PredictiveTemporalUPerHead(nn.Module):
         )
         
         # Compute unified losses (point prediction + mask segmentation)
-        total_loss, loss_components = self.unified_loss(
+        losses = self.unified_loss(
             pred_has_point=confidence,  # Point existence confidence: (B, 1)
             pred_points=points,  # Predicted point coordinates: (B, 1, 2)
             pred_masks=masks,  # Predicted mask logits: (B, 1, H, W)
             gt_semantic_seg=gt_semantic_seg,  # Ground truth masks: (B, 1, H_gt, W_gt)
             target_class=1,  # Target foreground class index
         )
-        
-        # Prepare training losses with unified loss components
-        losses = {
-            'loss_total': total_loss,  # Combined weighted loss
-            **loss_components  # Individual loss components for monitoring
-        }
         
         return losses

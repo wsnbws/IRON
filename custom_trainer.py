@@ -20,6 +20,7 @@ import json
 from mmcv.runner import build_optimizer
 import torch.optim.lr_scheduler as lr_scheduler
 import math
+from scripts.metrics import create_evaluator
 
 DEBUG = False
 
@@ -128,11 +129,8 @@ class CustomTrainer:
         batches_per_epoch = (num_train_data + total_batch_size - 1) // total_batch_size
         total_epochs = self.cfg.get('total_epochs', 10)
         total_iters = batches_per_epoch * total_epochs
-        # 保存总迭代数供后续按iter/epoch验证逻辑判断使用
         self.total_iters = total_iters
         warmup_ratio = self.cfg.lr_config.get('warmup_ratio', 1e-6) if hasattr(self.cfg, 'lr_config') else 1e-6
-        # 容错处理：未设置或为0则认为不启用warmup
-        # warmup_iters = int((self.cfg.lr_config.get('warmup_iters', 0) if hasattr(self.cfg, 'lr_config') else 0) or 0)
         warmup_iters = int(float(self.cfg.lr_config.get('warmlen_ratio', 0)) * total_iters)
         
         if self.rank == 0:
@@ -212,8 +210,8 @@ class CustomTrainer:
         if eval_interval and self._is_iter_time(eval_interval):
             if self.distributed and dist.is_initialized():
                 dist.barrier()
-            eval_metrics = self.validate()
             if self.rank == 0:
+                eval_metrics = self.validate()
                 if isinstance(eval_metrics, dict):
                     self.logger.info(
                         f'Iter {self.current_iter + 1}: '
@@ -236,79 +234,104 @@ class CustomTrainer:
                 print(f"gt_semantic_seg: {data_batch['gt_semantic_seg'].shape}")
                 print(f"img_metas: {data_batch['img_metas']}")
 
-            batch_losses = {
-                'decode.loss_seg_final': 0.0,
-                'decode.loss_seg_hist': 0.0,
-                'decode.acc_seg_final': 0.0,
-                'decode.acc_seg_hist': 0.0
-            }
-        
+            # Dynamic loss initialization and accumulation
+            batch_losses = {}
             num_frames_in_batch = self.cfg.data.train.get('num_frames', 1)
             self.optimizer.zero_grad()
             
             for t in range(num_frames_in_batch):
                 losses = self.model(**data_batch, step=t)
-                loss = losses["decode.loss_seg_final"] + losses["decode.loss_seg_hist"]
-                for key in batch_losses.keys():
-                    batch_losses[key] += losses[key].item()
-
-                loss.backward()
+                total_loss = 0.0
+                for key, value in losses.items():
+                    if t == 0:
+                        batch_losses[key] = value.item() / num_frames_in_batch
+                    else:
+                        batch_losses[key] += value.item() / num_frames_in_batch
+                    total_loss += value
+                total_loss.backward()
     
             self.optimizer.step()
             self.lr_scheduler.step()
-            
-            for key in batch_losses.keys():
-                batch_losses[key] /= num_frames_in_batch
 
-            # 多卡平均：将当前进程的batch指标在所有GPU之间做平均
-            metrics_tensor = torch.tensor([
-                batch_losses['decode.loss_seg_final'],
-                batch_losses['decode.loss_seg_hist'],
-                batch_losses['decode.acc_seg_final'],
-                batch_losses['decode.acc_seg_hist'],
-            ], device=self.device, dtype=torch.float32)
-
+            # Multi-GPU averaging: automatically handle all metrics
+            metrics_values = [value for _, value in batch_losses.items()]
+            metrics_tensor = torch.tensor(metrics_values, device=self.device, dtype=torch.float32)
             metrics_tensor = self._reduce_mean(metrics_tensor)
-
-            batch_losses['decode.loss_seg_final'] = metrics_tensor[0].item()
-            batch_losses['decode.loss_seg_hist'] = metrics_tensor[1].item()
-            batch_losses['decode.acc_seg_final'] = metrics_tensor[2].item()
-            batch_losses['decode.acc_seg_hist'] = metrics_tensor[3].item()
+            for i, (key, _) in enumerate(batch_losses.items()):
+                batch_losses[key] = metrics_tensor[i].item()
             
             if self.rank == 0 and batch_idx != 0 and (batch_idx % self.cfg.log_config.interval == 0 or batch_idx == len(self.train_loader) - 1):
-                self.logger.info(
-                    f'epoch: {self.current_epoch + 1}, '
-                    f'iter: {self.current_iter + 1}, '
-                    f'batch: {batch_idx + 1}/{len(self.train_loader)}, '
-                    f'avg_train_seg_loss: {batch_losses["decode.loss_seg_final"]:.4f}, '
-                    f'avg_train_seg_acc: {batch_losses["decode.acc_seg_final"]:.4f}, '
-                    f'avg_train_seg_hist_loss: {batch_losses["decode.loss_seg_hist"]:.4f}, '
-                    f'avg_train_seg_hist_acc: {batch_losses["decode.acc_seg_hist"]:.4f}, '
-                    f'lr: {self.optimizer.param_groups[-1]["lr"]:.4e} '
-                )
-            # 迭代级别的验证与保存
+                # Build dynamic loss logging string
+                log_parts = [
+                    f'epoch: {self.current_epoch + 1}',
+                    f'iter: {self.current_iter + 1}', 
+                    f'batch: {batch_idx + 1}/{len(self.train_loader)}',
+                    f'lr: {self.optimizer.param_groups[-1]["lr"]:.4e}'
+                ]
+                for key, value in batch_losses.items():
+                    log_parts.append(f'{key}: {value:.4f}')
+
+                self.logger.info(', '.join(log_parts))
             self._maybe_validate_and_checkpoint_iter()
             self.current_iter += 1
         
     def validate(self):
-
-        # if self.distributed and self.rank != 0:
-        #     return None
-
+        """Validate using incremental metrics calculation."""
         self.model.eval()
-        results = []
+        
+        # Create incremental evaluator for binary segmentation
+        # Assuming binary classification: 0=background, 1=drivable area
+        num_classes = getattr(self.cfg.model.decode_head, 'num_classes', 2)
+        ignore_index = getattr(self.cfg, 'ignore_index', 255)
+        threshold = getattr(self.cfg, 'test_threshold', 0.5)
+        
+        evaluator = create_evaluator(
+            num_classes=num_classes,
+            ignore_index=ignore_index,
+            metrics=['mIoU']
+        )
+        
+        if self.rank == 0:
+            self.logger.info(f"Starting validation with {len(self.val_loader)} batches")
+            self.logger.info(f"num_classes: {num_classes}, ignore_index: {ignore_index}, threshold: {threshold}")
+        
         with torch.no_grad():
-            for data_batch in self.val_loader:
-                data_batch = {'img': [_.cuda() for _ in data_batch['img']], 'img_metas': [_.data[0] for _ in data_batch['img_metas']], 'return_loss': False}
-                if self.rank == 0 and DEBUG == True:
-                    print(f"img: {data_batch['img']}")
-                    print(f"img_metas: {data_batch['img_metas']}")
-                with torch.no_grad():
-                    result = self.model(**data_batch)
-                    results.extend(result)
-            eval_metrics = self.val_loader.dataset.evaluate(results, logger=self.logger)
+            for batch_idx, data_batch in enumerate(self.val_loader):
+                # Prepare input data
+                imgs = [_.cuda() for _ in data_batch['img']]
+                img_metas = [_.data[0] for _ in data_batch['img_metas']]
+                
+                if self.rank == 0 and DEBUG:
+                    print(f"Batch {batch_idx}: img shape: {[img.shape for img in imgs]}")
+                    print(f"img_metas: {img_metas}")
+                
+                # Model inference with custom forward_test (sigmoid + threshold)
+                seg_preds = self.model.module.forward_test(imgs, img_metas, threshold=threshold)
+                
+                # Get ground truths from dataset
+                batch_gts = []
+                for img_meta in img_metas[0]:
+                    assert 'ann' in img_meta , f"ann is not in img_meta"
+                    gt_path = os.path.join(self.val_loader.dataset.ann_dir, img_meta['ann']['seg_map'])
+                    gt_seg = mmcv.imread(gt_path, flag='unchanged', backend='pillow')
+                    assert gt_seg is not None, f"GT path not found: {gt_path}"
+                    batch_gts.append(gt_seg)
+                    
+                # Stack batch_gts as numpy arrays (evaluator handles numpy/torch conversion)
+                batch_gts = np.stack(batch_gts, axis=0)
+                evaluator.add_batch(seg_preds.squeeze(0), batch_gts)
+                
+                if self.rank == 0 and (batch_idx + 1) % 50 == 0:
+                    self.logger.info(f"Processed {batch_idx + 1}/{len(self.val_loader)} batches")
+        
+        eval_metrics = evaluator.compute(logger=self.logger)
+        
+        if self.rank == 0:
+            self.logger.info("Validation completed using incremental metrics calculation")
+        
         self.model.train()
         return eval_metrics
+    
         
     def save_checkpoint(self, is_best=False):
         """仅在is_best=True时保存best.pth；否则不保存。仅rank0执行。"""
@@ -331,27 +354,23 @@ class CustomTrainer:
         self.logger.info(f'Best model saved to {best_path} (mIoU={self.best_metric:.4f})')
             
     def load_checkpoint(self, checkpoint_path):
-        """加载检查点"""
+    
         if not os.path.exists(checkpoint_path):
             self.logger.warning(f'Checkpoint {checkpoint_path} not found')
             return
             
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        
-        # 加载模型状态
+
         if self.distributed:
             self.model.module.load_state_dict(checkpoint['model_state_dict'])
         else:
             self.model.load_state_dict(checkpoint['model_state_dict'])
             
-        # 加载优化器状态
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         
-        # 加载学习率调度器状态
         if self.lr_scheduler and checkpoint.get('lr_scheduler_state_dict'):
             self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler_state_dict'])
             
-        # 恢复训练状态
         self.current_epoch = checkpoint.get('epoch', 0)
         self.current_iter = checkpoint.get('iter', 0)
         self.best_metric = checkpoint.get('best_metric', 0.0)

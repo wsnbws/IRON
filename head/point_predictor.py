@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 from .memory_attention import Attention
 from timm.models.vision_transformer import Block
-from timm.models.layers import Mlp
+from timm.models.vision_transformer import Mlp
 
 
 class PointPredictor(nn.Module):
@@ -29,10 +29,12 @@ class PointPredictor(nn.Module):
         hidden_dim: int = 512,
         num_heads: int = 4,
         topk_size: int = 256,
+        test_topk_size: int = 320,
         num_agg_tokens: int = 1, 
         num_self_attn_layers: int = 3,  
-        max_history_frames: int = 4, 
+        hist_queue_length: int = 4, 
         image_size: tuple=(512, 512),
+        test_image_size: tuple=(512, 640),
     ):
         """
         Args:
@@ -44,7 +46,7 @@ class PointPredictor(nn.Module):
             num_agg_tokens: 聚合token数量
             num_self_attn_layers: self attention层数
             k: 每帧的token数量，用于分离T和k
-            max_history_frames: 最大历史帧数量（队列长度）
+            hist_queue_length: 最大历史帧数量（队列长度）
         """
         super().__init__()
         self.current_dim = current_dim
@@ -53,12 +55,14 @@ class PointPredictor(nn.Module):
         self.num_agg_tokens = num_agg_tokens
         self.num_self_attn_layers = num_self_attn_layers
         self.k = topk_size
-        self.max_history_frames = max_history_frames
+        self.test_k = test_topk_size
+        self.hist_queue_length = hist_queue_length
         self.image_size = image_size
+        self.test_image_size = test_image_size
         
         self.unified_dim = hidden_dim // 2 
         self.current_agg_tokens = nn.Parameter(torch.randn(1, num_agg_tokens, self.unified_dim))
-        self.memory_agg_tokens = nn.Parameter(torch.randn(max_history_frames, num_agg_tokens, self.unified_dim))
+        self.memory_agg_tokens = nn.Parameter(torch.randn(hist_queue_length, num_agg_tokens, self.unified_dim))
         self.memory_proj = nn.Linear(memory_dim, self.unified_dim)
         self.current_proj = nn.Linear(current_dim, self.unified_dim)
         self.shared_self_attns = nn.ModuleList([
@@ -73,15 +77,14 @@ class PointPredictor(nn.Module):
             ) for _ in range(num_self_attn_layers)
         ])
         
-        self.norm1 = nn.LayerNorm(self.unified_dim * (num_agg_tokens + max_history_frames*num_agg_tokens))
+        self.norm1 = nn.LayerNorm(self.unified_dim * (num_agg_tokens + hist_queue_length*num_agg_tokens))
         self.final_mlp = Mlp(
-            in_features=self.unified_dim * (num_agg_tokens + max_history_frames*num_agg_tokens)  ,
+            in_features=self.unified_dim * (num_agg_tokens + hist_queue_length*num_agg_tokens)  ,
             hidden_features=hidden_dim,
             out_features=self.unified_dim,
             act_layer=nn.GELU,
             drop=0.1
         )
-        self.final_norm = nn.LayerNorm(self.unified_dim)
         
         self.confidence_head = nn.Sequential(
             nn.Linear(self.unified_dim, hidden_dim // 2),
@@ -125,12 +128,13 @@ class PointPredictor(nn.Module):
         """
 
         S, B, C = mem_features.shape
-        T = S // self.k
+        T = self.hist_queue_length
+        k = self.k if self.training else self.test_k
         assert C == self.memory_dim, f"Expected memory_dim={self.memory_dim}, got {C}"
-        assert S == T * self.k, f"S={S} should equal T*k={T}*{self.k}={T*self.k}"
+        assert S == T * k, f"S={S} should equal T*k={T}*{k}={T*k}"
         
-        mem_features_reshaped = mem_features.transpose(0, 1).view(B, T, self.k, C)
-        mem_features_proj = self.memory_proj(mem_features_reshaped).view(B * T, self.k, self.unified_dim)  # (B*T, k, unified_dim)
+        mem_features_reshaped = mem_features.transpose(0, 1).view(B, T, k, C)
+        mem_features_proj = self.memory_proj(mem_features_reshaped).view(B * T, k, self.unified_dim)  # (B*T, k, unified_dim)
         
         frame_specific_tokens = self.memory_agg_tokens[:T, :, :]  # (T, num_agg_tokens, unified_dim)
         frame_tokens = frame_specific_tokens.unsqueeze(0).expand(B, -1, -1, -1).contiguous().view(B * T, self.num_agg_tokens, self.unified_dim)
@@ -198,11 +202,12 @@ class PointPredictor(nn.Module):
         current_global_tokens = self.process_current_features(cur_features, cur_pos_enc)  # (B, num_agg_tokens, unified_dim)
         memory_global_tokens = frame_agg_tokens.flatten(1, 2)  # (B, T*num_agg_tokens, unified_dim)
         combined_tokens = torch.cat([current_global_tokens, memory_global_tokens], dim=1).flatten(1)  # (B, (num_agg_tokens + T*num_agg_tokens)*unified_dim)
-        final_global_token = self.final_norm(combined_tokens + self.final_mlp(self.norm1(combined_tokens)))  # (B, unified_dim)
+        final_global_token = self.final_mlp(self.norm1(combined_tokens)) # (B, unified_dim)
 
         confidence = self.confidence_head(final_global_token)
         points_flat = self.point_regressor(final_global_token)  # (B, num_points * 2)
         points = points_flat.view(B, self.num_points, 2)  # (B, num_points, 2)
+        image_size = self.test_image_size if self.training else self.image_size
         points = points * torch.tensor(list(self.image_size), device=points.device, dtype=points.dtype)
         
         return final_global_token, confidence, points  # (B, unified_dim), (B, num_points), (B, num_points, 2)

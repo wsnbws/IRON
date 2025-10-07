@@ -210,6 +210,7 @@ class DrivableVideoData(CustomDataset):
         results['group_index'] = img_info.get('group_index', None)
         results['group_size'] = img_info.get('group_size', None)
         results['is_seq_start'] = bool(img_info.get('is_seq_start', False))
+        results['ann'] = img_info.get('ann', None)
         self.pre_pipeline(results)
         return self.pipeline(results)
 

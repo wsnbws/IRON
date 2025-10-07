@@ -299,6 +299,23 @@ class EncoderDecoderVideo(BaseSegmentor):
         seg_pred = list(seg_pred)
         return seg_pred
 
+    def simple_test_custom(self, img, img_meta, rescale=True, threshold=0.5):
+        """Simple test for single channel mask output with sigmoid activation."""
+        seg_logit = self.inference_custom(img, img_meta, rescale)
+        # Apply sigmoid activation for single channel output
+        seg_prob = torch.sigmoid(seg_logit)
+        # Apply threshold to get binary mask (0: background, 1: drivable area)
+        seg_pred = (seg_prob > threshold).long()
+        
+        if torch.onnx.is_in_onnx_export():
+            # our inference backend only support 4D output
+            seg_pred = seg_pred.unsqueeze(0)
+            return seg_pred
+        
+        seg_pred = seg_pred.cpu().numpy()
+        # unravel batch dim
+        return seg_pred
+
     def aug_test(self, imgs, img_metas, rescale=True):
         """Test with augmentations.
 
@@ -318,7 +335,83 @@ class EncoderDecoderVideo(BaseSegmentor):
         seg_pred = list(seg_pred)
         return seg_pred
 
+    def aug_test_custom(self, imgs, img_metas, rescale=True, threshold=0.5):
+        """Test with augmentations for single channel mask output."""
+        # aug_test rescale all imgs back to ori_shape for now
+        assert rescale
+        # to save memory, we get augmented seg logit inplace
+        seg_logit = self.inference_custom(imgs[0], img_metas[0], rescale)
+        for i in range(1, len(imgs)):
+            cur_seg_logit = self.inference_custom(imgs[i], img_metas[i], rescale)
+            seg_logit += cur_seg_logit
+        seg_logit /= len(imgs)
+        
+        # Apply sigmoid activation and threshold
+        seg_prob = torch.sigmoid(seg_logit)
+        seg_pred = (seg_prob > threshold).long()
+        seg_pred = seg_pred.cpu().numpy()
+        # unravel batch dim
+        seg_pred = list(seg_pred)
+        return seg_pred
+
+    def inference_custom(self, img, img_meta, rescale):
+        """Inference for single channel output without softmax activation."""
+        assert self.test_cfg.mode in ['slide', 'whole']
+        ori_shape = img_meta[0]['ori_shape']
+        assert all(_['ori_shape'] == ori_shape for _ in img_meta)
+        
+        if self.test_cfg.mode == 'slide':
+            seg_logit = self.slide_inference(img, img_meta, rescale)
+        else:
+            seg_logit = self.whole_inference(img, img_meta, rescale)
+        
+        # For single channel output, we don't apply softmax
+        # The output should be raw logits that will be processed with sigmoid
+        flip = img_meta[0]['flip']
+        if flip:
+            flip_direction = img_meta[0]['flip_direction']
+            assert flip_direction in ['horizontal', 'vertical']
+            if flip_direction == 'horizontal':
+                seg_logit = seg_logit.flip(dims=(3, ))
+            elif flip_direction == 'vertical':
+                seg_logit = seg_logit.flip(dims=(2, ))
+
+        return seg_logit
+
     def forward_test(self, imgs, img_metas, **kwargs):
+        """Custom forward test for single channel mask output.
+        
+        Args:
+            imgs (List[Tensor]): Input images for test-time augmentations
+            img_metas (List[List[dict]]): Image metadata 
+            threshold (float): Threshold for binary segmentation, default 0.5
+        """
+        threshold = kwargs.pop('threshold', 0.5)
+        
+        for var, name in [(imgs, 'imgs'), (img_metas, 'img_metas')]:
+            if not isinstance(var, list):
+                raise TypeError(f'{name} must be a list, but got {type(var)}')
+
+        num_augs = len(imgs)
+        if num_augs != len(img_metas):
+            raise ValueError(f'num of augmentations ({len(imgs)}) != '
+                            f'num of image meta ({len(img_metas)})')
+        
+        # all images in the same aug batch all of the same ori_shape and pad shape
+        for img_meta in img_metas:
+            ori_shapes = [_['ori_shape'] for _ in img_meta]
+            assert all(shape == ori_shapes[0] for shape in ori_shapes)
+            img_shapes = [_['img_shape'] for _ in img_meta]
+            assert all(shape == img_shapes[0] for shape in img_shapes)
+            pad_shapes = [_['pad_shape'] for _ in img_meta]
+            assert all(shape == pad_shapes[0] for shape in pad_shapes)
+
+        if num_augs == 1:
+            return self.simple_test_custom(imgs[0], img_metas[0], threshold=threshold, **kwargs)
+        else:
+            return self.aug_test_custom(imgs, img_metas, threshold=threshold, **kwargs)
+
+    def forward_test_last(self, imgs, img_metas, **kwargs):
         """
         Args:
             imgs (List[Tensor]): the outer list indicates test-time

@@ -37,19 +37,19 @@ class MaskDecoder(nn.Module):
 
         self.output_upscaling = nn.Sequential(
             nn.ConvTranspose2d(
-                transformer_dim, transformer_dim // 4, kernel_size=2, stride=2
+                transformer_dim, transformer_dim, kernel_size=2, stride=2
             ),
-            LayerNorm2d(transformer_dim // 4),
+            LayerNorm2d(transformer_dim),
             activation(),
             nn.ConvTranspose2d(
-                transformer_dim // 4, transformer_dim // 8, kernel_size=2, stride=2
+                transformer_dim, transformer_dim, kernel_size=2, stride=2
             ),
             activation(),
         )
         self.use_high_res_features = use_high_res_features
         
         self.output_hypernetwork_mlp = MLP(
-            transformer_dim, transformer_dim, transformer_dim // 8, 3
+            transformer_dim, transformer_dim, transformer_dim, 3
         )
 
     def forward(
@@ -76,6 +76,7 @@ class MaskDecoder(nn.Module):
         src, pos_src= image_embeddings, image_pe
 
         output_tokens = self.mask_token.weight.unsqueeze(0).expand(B, -1, -1)  # (B, 1, C)
+        hist_cont_prompt_embeddings = hist_cont_prompt_embeddings.unsqueeze(1)
         tokens = torch.cat((output_tokens, sparse_prompt_embeddings, hist_cont_prompt_embeddings), dim=1)  # (B, 1+N+M, C)
         b, c, h, w = src.shape
 
@@ -91,7 +92,7 @@ class MaskDecoder(nn.Module):
             upscaled_embedding = act2(dc2(upscaled_embedding) + feat_s0)
 
         # Generate mask using hypernetwork
-        hyper_in = self.output_hypernetwork_mlp(mask_token_out)  # (B, C//8)
+        hyper_in = self.output_hypernetwork_mlp(mask_token_out)  # (B, C)
         b, c, h, w = upscaled_embedding.shape
         masks = (hyper_in.unsqueeze(1) @ upscaled_embedding.view(b, c, h * w)).view(b, 1, h, w)
 

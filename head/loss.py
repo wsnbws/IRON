@@ -147,13 +147,14 @@ class otdr_loss(nn.Module):
             valid_pred = pred_points[positive_mask].squeeze(1)  # (N_pos, 2)
             valid_gt = gt_centers[positive_mask]  # (N_pos, 2)
             
-            # Compute L2 distance between predicted and ground truth points
-            distance = torch.norm(valid_pred - valid_gt, p=2, dim=1)  # (N_pos,)
-            
-            # Normalize by image diagonal for scale invariance
-            if self.normalize_by_image_size:
-                diagonal = torch.sqrt(torch.tensor(H**2 + W**2, dtype=distance.dtype, device=distance.device))
-                distance = distance / diagonal
+            # Normalize coordinates by image size before computing loss
+            # x normalized by W, y normalized by H
+            scale_vec = torch.tensor([W, H], dtype=valid_pred.dtype, device=valid_pred.device)
+            valid_pred_norm = valid_pred / scale_vec
+            valid_gt_norm = valid_gt / scale_vec
+
+            # Compute L2 distance in normalized coordinate space
+            distance = torch.norm(valid_pred_norm - valid_gt_norm, p=2, dim=1)  # (N_pos,)
             
             reg_loss = distance.mean()
         else:
@@ -245,19 +246,11 @@ class otdr_loss(nn.Module):
             pred_masks, gt_semantic_seg, target_class
         )
         
-        # Combine weighted losses
-        total_loss = (
-            self.cls_weight * cls_loss + 
-            self.reg_weight * reg_loss + 
-            self.seg_weight * seg_loss
-        )
-        
         # Prepare detailed loss information
         loss_dict = {
-            'loss_point_cls': cls_loss.item(),
-            'loss_point_reg': reg_loss.item(),
-            'loss_mask_seg': seg_loss.item(),
-            'point_targets': target_has_point.mean().item(),
+            'loss_point_cls': cls_loss * self.cls_weight,
+            'loss_point_reg': reg_loss * self.reg_weight,
+            'loss_mask_seg': seg_loss * self.seg_weight,
         }
         
-        return total_loss, loss_dict
+        return loss_dict

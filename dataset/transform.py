@@ -598,7 +598,7 @@ class CollectVideo(object):
         'filename', 'ori_filename', 'ori_shape', 'img_shape', 'pad_shape',
         'scale_factor', 'flip', 'flip_direction', 'img_norm_cfg', 'num_frames',
         'frame_paths', 'frame_timestamps', 'target_timestamp', 'gt_semantic_segs',
-        'group_id', 'group_index', 'group_size', 'is_seq_start'
+        'group_id', 'group_index', 'group_size', 'is_seq_start','ann'
     )):
         self.keys = keys
         self.meta_keys = meta_keys

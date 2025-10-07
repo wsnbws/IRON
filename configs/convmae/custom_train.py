@@ -8,12 +8,12 @@ crop_size = (512, 512)
 HISTORY_LENGTH = 4
 total_epochs = 40
 lr_config = dict(
-    warmup_ratio=1e-3,
+    warmup_ratio=1e-2,
     warmup_iters=500,
     warmlen_ratio=0.05
 )
 val_epoch = 1
-evaluation = dict(interval=200)
+evaluation = dict(interval=374)
 # Batch size per GPU; note each sample is a clip of num_frames
 data = dict(samples_per_gpu=8, workers_per_gpu=2)
 

@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch import nn, Tensor
 
 from head.position_embed import apply_rotary_enc, compute_axial_cis
-from head.untils import MLP
+from head.untils import MLP, scaled_dot_product_attention
 
 
 class TwoWayTransformer(nn.Module):
@@ -240,7 +240,7 @@ class Attention(nn.Module):
 
         dropout_p = self.dropout_p if self.training else 0.0
         # Attention
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        out = scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
 
         out = self._recombine_heads(out)
         out = self.out_proj(out)
@@ -303,7 +303,7 @@ class RoPEAttention(Attention):
 
         dropout_p = self.dropout_p if self.training else 0.0
         # Attention
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        out = scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
 
         out = self._recombine_heads(out)
         out = self.out_proj(out)

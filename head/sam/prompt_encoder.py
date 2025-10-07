@@ -15,8 +15,8 @@ class PromptEncoder(nn.Module):
         embed_dim: int,
         image_embedding_size: Tuple[int, int],
         input_image_size: Tuple[int, int],
-        image_embedding_size_test: Tuple[int, int],
-        input_image_size_test: Tuple[int, int],
+        test_image_embedding_size: Tuple[int, int],
+        test_input_image_size: Tuple[int, int],
     ) -> None:
         """
         Encodes point prompts for input to SAM's mask decoder.
@@ -32,6 +32,8 @@ class PromptEncoder(nn.Module):
         self.embed_dim = embed_dim
         self.input_image_size = input_image_size
         self.image_embedding_size = image_embedding_size
+        self.test_input_image_size = test_input_image_size
+        self.test_image_embedding_size = test_image_embedding_size
         self.pe_layer = PositionEmbeddingRandom(embed_dim // 2)
 
         self.point_embedding = nn.Embedding(1, embed_dim)
@@ -52,7 +54,7 @@ class PromptEncoder(nn.Module):
         if self.training:
           input_image_size = self.input_image_size
         else:
-          input_image_size = self.input_image_size_test
+          input_image_size = self.test_input_image_size
         pos_embed = self.pe_layer.forward_with_coords(points, input_image_size)
         gate = confidences.to(pos_embed.dtype).unsqueeze(-1)  # (B, N, 1)
         token = gate * self.point_embedding.weight + (1.0 - gate) * self.not_a_point_embed.weight
@@ -71,7 +73,7 @@ class PromptEncoder(nn.Module):
         if self.training:  
           return self.pe_layer(self.image_embedding_size).unsqueeze(0)
         else:
-          return self.pe_layer(self.image_embedding_size_test).unsqueeze(0)
+          return self.pe_layer(self.test_image_embedding_size).unsqueeze(0)
 
     def _get_device(self) -> torch.device:
         return self.point_embedding.weight.device
