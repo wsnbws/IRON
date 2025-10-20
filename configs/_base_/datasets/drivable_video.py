@@ -1,11 +1,12 @@
 # dataset settings for temporal video segmentation
 
 dataset_type = 'DrivableVideoData'
-data_root = '/data20t/wangshuo/IR_Drivable/baseline'
-# data_root = '/public/home/wangshuo/DrivableTask/data/Video'
+# data_root = '/data20t/wangshuo/IR_Drivable/baseline'
+data_root = '/8TBHDD3/ws/OTDR'
+# data_root = '/data20t/wangshuo/IR_Drivable/OTDR/test/images'
 
 # number of frames per clip and temporal stride
-num_frames = 8
+num_frames = 6
 frame_stride = 1
 
 img_norm_cfg = dict(
@@ -71,20 +72,20 @@ data = dict(
     train=dict(
         type=dataset_type,
         data_root=data_root,
-        img_dir='images/training/xts_video',
-        ann_dir=  'anns/training/xts_video',
+        img_dir='train/images',
+        ann_dir='train/anns',
         img_suffix='.jpg',
         seg_map_suffix='.png',
         num_frames=num_frames,
         frame_stride=frame_stride,
         pipeline=train_pipeline,
-        stride_choices=[1],
+        stride_choices=[1,2],
     ),
     val=dict(
         type=dataset_type,
         data_root=data_root,
-        img_dir='images/test/xts_video',
-        ann_dir=  'anns/test/xts_video',
+        img_dir='test/images',
+        ann_dir='test/anns',
         img_suffix='.jpg',
         seg_map_suffix='.png',
         num_frames=num_frames,
@@ -94,8 +95,8 @@ data = dict(
     test=dict(
         type=dataset_type,
         data_root=data_root,
-        img_dir='images/test/xts_video',
-        ann_dir=  'anns/test/xts_video',
+        img_dir='test/images',
+        ann_dir='test/anns',
         img_suffix='.jpg',
         seg_map_suffix='.png',
         num_frames=num_frames,

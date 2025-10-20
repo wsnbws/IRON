@@ -4,18 +4,18 @@ _base_ = [
     '../_base_/default_runtime.py',
 ]
 
+
 crop_size = (512, 512)
-HISTORY_LENGTH = 4
-total_epochs = 40
+HISTORY_LENGTH = 3
+total_epochs = 10
 lr_config = dict(
     warmup_ratio=1e-2,
-    warmup_iters=500,
     warmlen_ratio=0.05
 )
 val_epoch = 1
-evaluation = dict(interval=374)
+evaluation = dict(interval=340)
 # Batch size per GPU; note each sample is a clip of num_frames
-data = dict(samples_per_gpu=8, workers_per_gpu=2)
+data = dict(samples_per_gpu=4, workers_per_gpu=2)
 
 model = dict(
     history_length=HISTORY_LENGTH,
@@ -68,7 +68,7 @@ optimizer = dict(
     betas=(0.9, 0.999),
     weight_decay=0.05,
     constructor='LayerDecayOptimizerConstructor',
-    paramwise_cfg=dict(num_layers=11, layer_decay_rate=0.75)
+    paramwise_cfg=dict(num_layers=11, layer_decay_rate=0.8)
 )
 
 # do not use mmdet version fp16 

@@ -8,6 +8,7 @@ from mmseg.ops import resize
 from mmseg.models import builder
 from mmseg.models.builder import SEGMENTORS
 from mmseg.models.segmentors.base import BaseSegmentor
+from head.flag import get_test_task_state
 
 
 @contextmanager
@@ -53,6 +54,8 @@ class EncoderDecoderVideo(BaseSegmentor):
         self.history_length = history_length
 
         self.init_weights(pretrained=pretrained)
+
+        self.img_feature = None
 
         assert self.with_decode_head
 
@@ -101,13 +104,13 @@ class EncoderDecoderVideo(BaseSegmentor):
         """Encode images with backbone and decode into a semantic segmentation
         map of the same size as input."""
         x = self.extract_feat(img)
-        out = self._decode_head_forward_test(x, img_metas)
-        out = resize(
-            input=out,
+        seg_logits, confidence, points = self._decode_head_forward_test(x, img_metas)
+        seg_logits = resize(
+            input=seg_logits,
             size=img.shape[-2:],
             mode='bilinear',
             align_corners=self.align_corners)
-        return out
+        return seg_logits, confidence, points
 
     def _get_timestamp(self, img_metas, t):
         batch_timestamps = [] 
@@ -131,11 +134,10 @@ class EncoderDecoderVideo(BaseSegmentor):
         # If time index is provided, mark sequence start for streaming heads
         batch_timestamps = self._get_timestamp(img_metas, t)
         ts_tensor = torch.tensor(batch_timestamps, dtype=torch.float32)
-        with amp_off():
-            loss_decode = self.decode_head.forward_train(x, img_metas,
-                                                         gt_semantic_seg,
-                                                         t=t,
-                                                         timestamps=ts_tensor)
+        loss_decode = self.decode_head.forward_train(x, img_metas,
+                                                        gt_semantic_seg,
+                                                        t=t,
+                                                        timestamps=ts_tensor)
 
         losses.update(add_prefix(loss_decode, 'decode'))
         return losses
@@ -145,8 +147,8 @@ class EncoderDecoderVideo(BaseSegmentor):
         inference."""
         # If the decode head supports streaming and we are given single-frame inputs
         # per sample (B, C, H, W) at test time, just call forward as usual.
-        seg_logits = self.decode_head.forward_test(x, img_metas, self.test_cfg)
-        return seg_logits
+        seg_logits, confidence, points = self.decode_head.forward_test(x, img_metas, self.test_cfg)
+        return seg_logits, confidence, points
 
     def _auxiliary_head_forward_train(self, x, img_metas, gt_semantic_seg):
         """Run forward function and calculate loss for auxiliary head in
@@ -165,82 +167,47 @@ class EncoderDecoderVideo(BaseSegmentor):
 
         return losses
 
-    def forward_dummy(self, img):
-        """Dummy forward function."""
-        seg_logit = self.encode_decode(img, None)
-
-        return seg_logit
-
     def forward_train(self, img, img_metas, gt_semantic_seg, step):
 
         final_losses = dict()
         
         gtn = torch.stack([gt['gt_semantic_segs'].data for gt in img_metas], dim=0).to(img.device)
-        img_t = img[:, step]
-        x_t = self.extract_feat(img_t)
+        
+        # # 在 step == 0 时，批量计算所有帧的 backbone + FPN + PSP
+        # if step == 0:
+        #     B, T, C, H, W = img.shape
+        #     # 1. 批量提取 backbone 特征: (B, T, C, H, W) -> (B*T, C, H, W)
+        #     img_flat = img.view(B * T, C, H, W)
+        #     img_feat_flat = self.extract_feat(img_flat)  # (B*T, C_feat, H_feat, W_feat)
+        #     fpn_outs_flat = self.decode_head._fpn_forward_single(img_feat_flat)  # list((B*T, C_dec, H_feat, W_feat))
+        #     if len(fpn_outs_flat) > 1:
+        #         fpn_last_flat = fpn_outs_flat[-1]  # 使用最高分辨率特征
+        #     else:
+        #         fpn_last_flat = fpn_outs_flat[0]
+            
+        #     fpn_outs_flat[-1] = self.decode_head.psp_module(fpn_last_flat)  # (B*T, C_dec, H_feat, W_feat)
+        #     self.img_feature = fpn_outs_flat
+        
+        # fpn_outs_step = [i.view(B, T, *i.shape[1:])[:, step] for i in self.img_feature]
+        img_feature = self.extract_feat(img[:, step])
         gt_t = gtn[:, step].unsqueeze(1)
 
-        loss_decode_t = self._decode_head_forward_train(x_t, img_metas, gt_t, t=step)
+        # 因为特征已经过 FPN+PSP 处理，所以传入 skip_fpn_psp=True
+        loss_decode_t = self._decode_head_forward_train(img_feature, img_metas, gt_t, t=step)
         for k, v in loss_decode_t.items():
             final_losses[k] = final_losses.get(k, 0) + v
 
         if self.with_auxiliary_head:
-            loss_aux_t = self._auxiliary_head_forward_train(x_t, img_metas, gt_t)
+            loss_aux_t = self._auxiliary_head_forward_train(img_feature, img_metas, gt_t)
             for k, v in loss_aux_t.items():
                 final_losses[k] = final_losses.get(k, 0) + v
                 
         return final_losses
 
-    # TODO refactor
-    def slide_inference(self, img, img_meta, rescale):
-        """Inference by sliding-window with overlap.
-
-        If h_crop > h_img or w_crop > w_img, the small patch will be used to
-        decode without padding.
-        """
-
-        h_stride, w_stride = self.test_cfg.stride
-        h_crop, w_crop = self.test_cfg.crop_size
-        batch_size, _, h_img, w_img = img.size()
-        num_classes = self.num_classes
-        h_grids = max(h_img - h_crop + h_stride - 1, 0) // h_stride + 1
-        w_grids = max(w_img - w_crop + w_stride - 1, 0) // w_stride + 1
-        preds = img.new_zeros((batch_size, num_classes, h_img, w_img))
-        count_mat = img.new_zeros((batch_size, 1, h_img, w_img))
-        for h_idx in range(h_grids):
-            for w_idx in range(w_grids):
-                y1 = h_idx * h_stride
-                x1 = w_idx * w_stride
-                y2 = min(y1 + h_crop, h_img)
-                x2 = min(x1 + w_crop, w_img)
-                y1 = max(y2 - h_crop, 0)
-                x1 = max(x2 - w_crop, 0)
-                crop_img = img[:, :, y1:y2, x1:x2]
-                crop_seg_logit = self.encode_decode(crop_img, img_meta)
-                preds += F.pad(crop_seg_logit,
-                               (int(x1), int(preds.shape[3] - x2), int(y1),
-                                int(preds.shape[2] - y2)))
-
-                count_mat[:, :, y1:y2, x1:x2] += 1
-        assert (count_mat == 0).sum() == 0
-        if torch.onnx.is_in_onnx_export():
-            # cast count_mat to constant while exporting to ONNX
-            count_mat = torch.from_numpy(
-                count_mat.cpu().detach().numpy()).to(device=img.device)
-        preds = preds / count_mat
-        if rescale:
-            preds = resize(
-                preds,
-                size=img_meta[0]['ori_shape'][:2],
-                mode='bilinear',
-                align_corners=self.align_corners,
-                warning=False)
-        return preds
-
     def whole_inference(self, img, img_meta, rescale):
         """Inference with full image."""
 
-        seg_logit = self.encode_decode(img, img_meta)
+        seg_logit, confidence, points = self.encode_decode(img, img_meta)
         if rescale:
             seg_logit = resize(
                 seg_logit,
@@ -249,124 +216,36 @@ class EncoderDecoderVideo(BaseSegmentor):
                 align_corners=self.align_corners,
                 warning=False)
 
-        return seg_logit
+        return seg_logit, confidence, points
 
-    def inference(self, img, img_meta, rescale):
-        """Inference with slide/whole style.
-
+    def forward_test(self, imgs, img_metas, **kwargs):
+        """Forward test for single channel mask output with sigmoid activation.
+        
         Args:
-            img (Tensor): The input image of shape (N, 3, H, W).
-            img_meta (dict): Image info dict where each dict has: 'img_shape',
-                'scale_factor', 'flip', and may also contain
-                'filename', 'ori_shape', 'pad_shape', and 'img_norm_cfg'.
-                For details on the values of these keys see
-                `mmseg/datasets/pipelines/formatting.py:Collect`.
-            rescale (bool): Whether rescale back to original shape.
-
-        Returns:
-            Tensor: The output segmentation map.
+            imgs (List[Tensor]): Input images (only single image supported)
+            img_metas (List[List[dict]]): Image metadata 
+            threshold (float): Threshold for binary segmentation, default 0.5
+            rescale (bool): Whether to rescale back to original shape, default True
         """
-
-        assert self.test_cfg.mode in ['slide', 'whole']
-        ori_shape = img_meta[0]['ori_shape']
-        assert all(_['ori_shape'] == ori_shape for _ in img_meta)
-        if self.test_cfg.mode == 'slide':
-            seg_logit = self.slide_inference(img, img_meta, rescale)
-        else:
-            seg_logit = self.whole_inference(img, img_meta, rescale)
-        output = F.softmax(seg_logit, dim=1)
-        flip = img_meta[0]['flip']
-        if flip:
-            flip_direction = img_meta[0]['flip_direction']
-            assert flip_direction in ['horizontal', 'vertical']
-            if flip_direction == 'horizontal':
-                output = output.flip(dims=(3, ))
-            elif flip_direction == 'vertical':
-                output = output.flip(dims=(2, ))
-
-        return output
-
-    def simple_test(self, img, img_meta, rescale=True):
-        """Simple test with single image."""
-        seg_logit = self.inference(img, img_meta, rescale)
-        seg_pred = seg_logit.argmax(dim=1)
-        if torch.onnx.is_in_onnx_export():
-            # our inference backend only support 4D output
-            seg_pred = seg_pred.unsqueeze(0)
-            return seg_pred
-        seg_pred = seg_pred.cpu().numpy()
-        # unravel batch dim
-        seg_pred = list(seg_pred)
-        return seg_pred
-
-    def simple_test_custom(self, img, img_meta, rescale=True, threshold=0.5):
-        """Simple test for single channel mask output with sigmoid activation."""
-        seg_logit = self.inference_custom(img, img_meta, rescale)
-        # Apply sigmoid activation for single channel output
-        seg_prob = torch.sigmoid(seg_logit)
-        # Apply threshold to get binary mask (0: background, 1: drivable area)
-        seg_pred = (seg_prob > threshold).long()
+        threshold = kwargs.pop('threshold', 0.5)
+        rescale = kwargs.pop('rescale', True)
         
-        if torch.onnx.is_in_onnx_export():
-            # our inference backend only support 4D output
-            seg_pred = seg_pred.unsqueeze(0)
-            return seg_pred
-        
-        seg_pred = seg_pred.cpu().numpy()
-        # unravel batch dim
-        return seg_pred
+        # Input validation
+        for var, name in [(imgs, 'imgs'), (img_metas, 'img_metas')]:
+            if not isinstance(var, list):
+                raise TypeError(f'{name} must be a list, but got {type(var)}')
 
-    def aug_test(self, imgs, img_metas, rescale=True):
-        """Test with augmentations.
-
-        Only rescale=True is supported.
-        """
-        # aug_test rescale all imgs back to ori_shape for now
-        assert rescale
-        # to save memory, we get augmented seg logit inplace
-        seg_logit = self.inference(imgs[0], img_metas[0], rescale)
-        for i in range(1, len(imgs)):
-            cur_seg_logit = self.inference(imgs[i], img_metas[i], rescale)
-            seg_logit += cur_seg_logit
-        seg_logit /= len(imgs)
-        seg_pred = seg_logit.argmax(dim=1)
-        seg_pred = seg_pred.cpu().numpy()
-        # unravel batch dim
-        seg_pred = list(seg_pred)
-        return seg_pred
-
-    def aug_test_custom(self, imgs, img_metas, rescale=True, threshold=0.5):
-        """Test with augmentations for single channel mask output."""
-        # aug_test rescale all imgs back to ori_shape for now
-        assert rescale
-        # to save memory, we get augmented seg logit inplace
-        seg_logit = self.inference_custom(imgs[0], img_metas[0], rescale)
-        for i in range(1, len(imgs)):
-            cur_seg_logit = self.inference_custom(imgs[i], img_metas[i], rescale)
-            seg_logit += cur_seg_logit
-        seg_logit /= len(imgs)
+        # Only support single image inference
+        assert len(imgs) == 1, "Only single image inference is supported"
+        assert len(img_metas) == 1, "Only single image metadata is supported"
         
-        # Apply sigmoid activation and threshold
-        seg_prob = torch.sigmoid(seg_logit)
-        seg_pred = (seg_prob > threshold).long()
-        seg_pred = seg_pred.cpu().numpy()
-        # unravel batch dim
-        seg_pred = list(seg_pred)
-        return seg_pred
-
-    def inference_custom(self, img, img_meta, rescale):
-        """Inference for single channel output without softmax activation."""
-        assert self.test_cfg.mode in ['slide', 'whole']
-        ori_shape = img_meta[0]['ori_shape']
-        assert all(_['ori_shape'] == ori_shape for _ in img_meta)
+        img = imgs[0]
+        img_meta = img_metas[0]
         
-        if self.test_cfg.mode == 'slide':
-            seg_logit = self.slide_inference(img, img_meta, rescale)
-        else:
-            seg_logit = self.whole_inference(img, img_meta, rescale)
+        # Get raw logits, confidence and points from whole image inference
+        seg_logit, confidence, points = self.whole_inference(img, img_meta, rescale)
         
-        # For single channel output, we don't apply softmax
-        # The output should be raw logits that will be processed with sigmoid
+        # Handle image flipping if specified
         flip = img_meta[0]['flip']
         if flip:
             flip_direction = img_meta[0]['flip_direction']
@@ -375,72 +254,17 @@ class EncoderDecoderVideo(BaseSegmentor):
                 seg_logit = seg_logit.flip(dims=(3, ))
             elif flip_direction == 'vertical':
                 seg_logit = seg_logit.flip(dims=(2, ))
-
-        return seg_logit
-
-    def forward_test(self, imgs, img_metas, **kwargs):
-        """Custom forward test for single channel mask output.
         
-        Args:
-            imgs (List[Tensor]): Input images for test-time augmentations
-            img_metas (List[List[dict]]): Image metadata 
-            threshold (float): Threshold for binary segmentation, default 0.5
-        """
-        threshold = kwargs.pop('threshold', 0.5)
+        # Apply sigmoid activation for single channel output
+        seg_prob = torch.sigmoid(seg_logit)
+        # Apply threshold to get binary mask (0: background, 1: drivable area)
+        seg_pred = (seg_prob > threshold).long()
+
+        if torch.onnx.is_in_onnx_export():
+            # our inference backend only support 4D output
+            seg_pred = seg_pred.unsqueeze(0)
+            return seg_pred, confidence, points
         
-        for var, name in [(imgs, 'imgs'), (img_metas, 'img_metas')]:
-            if not isinstance(var, list):
-                raise TypeError(f'{name} must be a list, but got {type(var)}')
+        seg_pred = seg_pred.cpu().numpy()
 
-        num_augs = len(imgs)
-        if num_augs != len(img_metas):
-            raise ValueError(f'num of augmentations ({len(imgs)}) != '
-                            f'num of image meta ({len(img_metas)})')
-        
-        # all images in the same aug batch all of the same ori_shape and pad shape
-        for img_meta in img_metas:
-            ori_shapes = [_['ori_shape'] for _ in img_meta]
-            assert all(shape == ori_shapes[0] for shape in ori_shapes)
-            img_shapes = [_['img_shape'] for _ in img_meta]
-            assert all(shape == img_shapes[0] for shape in img_shapes)
-            pad_shapes = [_['pad_shape'] for _ in img_meta]
-            assert all(shape == pad_shapes[0] for shape in pad_shapes)
-
-        if num_augs == 1:
-            return self.simple_test_custom(imgs[0], img_metas[0], threshold=threshold, **kwargs)
-        else:
-            return self.aug_test_custom(imgs, img_metas, threshold=threshold, **kwargs)
-
-    def forward_test_last(self, imgs, img_metas, **kwargs):
-        """
-        Args:
-            imgs (List[Tensor]): the outer list indicates test-time
-                augmentations and inner Tensor should have a shape NxCxHxW,
-                which contains all images in the batch.
-            img_metas (List[List[dict]]): the outer list indicates test-time
-                augs (multiscale, flip, etc.) and the inner list indicates
-                images in a batch.
-        """
-        for var, name in [(imgs, 'imgs'), (img_metas, 'img_metas')]:
-            if not isinstance(var, list):
-                raise TypeError(f'{name} must be a list, but got '
-                                f'{type(var)}')
-
-        num_augs = len(imgs)
-        if num_augs != len(img_metas):
-            raise ValueError(f'num of augmentations ({len(imgs)}) != '
-                                f'num of image meta ({len(img_metas)})')
-        # all images in the same aug batch all of the same ori_shape and pad
-        # shape
-        for img_meta in img_metas:
-            ori_shapes = [_['ori_shape'] for _ in img_meta]
-            assert all(shape == ori_shapes[0] for shape in ori_shapes)
-            img_shapes = [_['img_shape'] for _ in img_meta]
-            assert all(shape == img_shapes[0] for shape in img_shapes)
-            pad_shapes = [_['pad_shape'] for _ in img_meta]
-            assert all(shape == pad_shapes[0] for shape in pad_shapes)
-
-        if num_augs == 1:
-            return self.simple_test(imgs[0], img_metas[0], **kwargs)
-        else:
-            return self.aug_test(imgs, img_metas, **kwargs)
+        return seg_pred, confidence, points

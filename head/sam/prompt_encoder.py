@@ -36,8 +36,8 @@ class PromptEncoder(nn.Module):
         self.test_image_embedding_size = test_image_embedding_size
         self.pe_layer = PositionEmbeddingRandom(embed_dim // 2)
 
-        self.point_embedding = nn.Embedding(1, embed_dim)
-        self.not_a_point_embed = nn.Embedding(1, embed_dim)
+        # self.point_embedding = nn.Embedding(1, embed_dim)
+        # self.not_a_point_embed = nn.Embedding(1, embed_dim)
 
     def _embed_points(
         self,

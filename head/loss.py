@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from typing import Tuple
 import numpy as np
 import cv2
-
+from head.flag import get_task_state
 class otdr_loss(nn.Module):
     """
     Unified loss for video segmentation with point prediction and mask generation.
@@ -78,6 +78,10 @@ class otdr_loss(nn.Module):
         
         for i in range(B):
             mask = target_mask[i]  # (H, W)
+            
+            # Add background border around mask to prevent edge bias in distance transform
+            # This ensures that masks touching image boundaries are properly handled
+            mask = np.pad(mask, pad_width=1, mode='constant', constant_values=0) # set border to background
             mask_area = mask.sum()
             area_list.append(float(mask_area))
 
@@ -115,7 +119,7 @@ class otdr_loss(nn.Module):
         Compute point prediction losses (classification + regression).
         
         Args:
-            pred_has_point (Tensor): Point existence logits (B,) or (B, 1)
+            pred_has_point (Tensor): Point existence probabilities (B,) or (B, 1) - already sigmoid-activated
             pred_points (Tensor): Predicted point coordinates (B, 1, 2) in pixel space
             gt_semantic_seg (Tensor): Ground truth masks (B, 1, H, W) with class labels
             target_class (int): Foreground class index. Default: 1
@@ -139,7 +143,8 @@ class otdr_loss(nn.Module):
         target_has_point = ((areas >= min_pixels) & valid_mask).float()  # (B,)
         
         # Classification loss: point existence prediction
-        cls_loss = F.binary_cross_entropy_with_logits(pred_has_point, target_has_point)
+        # Note: pred_has_point is already sigmoid-activated, so use binary_cross_entropy instead of binary_cross_entropy_with_logits
+        cls_loss = F.binary_cross_entropy(pred_has_point, target_has_point)
         
         # Regression loss: point coordinate prediction (only for positive samples)
         positive_mask = target_has_point > 0.0
@@ -206,22 +211,21 @@ class otdr_loss(nn.Module):
         
         # Compute binary cross-entropy loss with logits
         seg_loss = F.binary_cross_entropy_with_logits(pred_flat, target_flat, reduction='mean')
-        
         return seg_loss
     
     def forward(
         self,
-        pred_has_point: torch.Tensor,
-        pred_points: torch.Tensor,
-        pred_masks: torch.Tensor,
+        pred_masks,
         gt_semantic_seg: torch.Tensor,
+        pred_has_point: torch.Tensor = None,
+        pred_points: torch.Tensor = None,
         target_class: int = 1,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Compute unified loss combining point prediction and mask segmentation.
         
         Args:
-            pred_has_point (Tensor): Point existence logits (B,) or (B, 1)
+            pred_has_point (Tensor): Point existence probabilities (B,) or (B, 1) - already sigmoid-activated
             pred_points (Tensor): Predicted point coordinates (B, 1, 2)
             pred_masks (Tensor): Predicted mask logits (B, 1, H, W)
             gt_semantic_seg (Tensor): Ground truth masks (B, 1, H, W) with class labels
@@ -237,20 +241,37 @@ class otdr_loss(nn.Module):
                     - 'point_targets': Mean number of valid point targets
         """
         # Compute point prediction losses
-        cls_loss, reg_loss, target_has_point = self.compute_point_losses(
-            pred_has_point, pred_points, gt_semantic_seg, target_class
-        )
+        # cls_loss, reg_loss, target_has_point = self.compute_point_losses(
+        #     pred_has_point, pred_points, gt_semantic_seg, target_class
+        # )
         
         # Compute mask segmentation loss
-        seg_loss = self.compute_segmentation_loss(
-            pred_masks, gt_semantic_seg, target_class
-        )
+        if gt_semantic_seg.dim() == 3:  # (B, H, W)
+            gt_semantic_seg = gt_semantic_seg.unsqueeze(1)  # (B, 1, H, W)
+            
+        if isinstance(pred_masks, list) or isinstance(pred_masks, tuple):
+            mask_coarse, mask_mid, mask_fine = pred_masks
+            fine_loss = self.compute_segmentation_loss(
+                mask_fine, gt_semantic_seg, target_class
+            )
+            mid_loss = self.compute_segmentation_loss(
+                mask_mid, F.interpolate(gt_semantic_seg.float(), scale_factor=0.25, mode='nearest').long(), target_class
+            )
+            coarse_loss = self.compute_segmentation_loss(
+                mask_coarse, F.interpolate(gt_semantic_seg.float(), scale_factor=0.125, mode='nearest').long(), target_class
+            )
+        else:   
+            seg_loss = self.compute_segmentation_loss(
+                pred_masks, gt_semantic_seg, target_class
+            )
         
         # Prepare detailed loss information
         loss_dict = {
-            'loss_point_cls': cls_loss * self.cls_weight,
-            'loss_point_reg': reg_loss * self.reg_weight,
-            'loss_mask_seg': seg_loss * self.seg_weight,
+            # 'loss_point_cls': cls_loss * self.cls_weight,
+            # 'loss_point_reg': reg_loss * self.reg_weight,
+            'mask_coarse_loss': coarse_loss,
+            'mask_mid_loss': mid_loss,
+            'mask_fine_loss': fine_loss,
         }
         
         return loss_dict

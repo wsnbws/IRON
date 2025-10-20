@@ -21,6 +21,7 @@ from mmcv.runner import build_optimizer
 import torch.optim.lr_scheduler as lr_scheduler
 import math
 from scripts.metrics import create_evaluator
+from head.flag import switch_task_state
 
 DEBUG = False
 
@@ -50,6 +51,7 @@ class CustomTrainer:
         self.current_epoch = 0
         self.current_iter = 0
         self.best_metric = 0.0
+        self.best_macc = 0.0
     
         self.checkpoint_dir = os.path.join(cfg.work_dir, 'checkpoints')
         os.makedirs(self.checkpoint_dir, exist_ok=True)
@@ -131,7 +133,7 @@ class CustomTrainer:
         total_iters = batches_per_epoch * total_epochs
         self.total_iters = total_iters
         warmup_ratio = self.cfg.lr_config.get('warmup_ratio', 1e-6) if hasattr(self.cfg, 'lr_config') else 1e-6
-        warmup_iters = int(float(self.cfg.lr_config.get('warmlen_ratio', 0)) * total_iters)
+        warmup_iters = 250
         
         if self.rank == 0:
             self.logger.info(f"Dataset size: {num_train_data}")
@@ -185,10 +187,12 @@ class CustomTrainer:
         if not isinstance(eval_metrics, dict):
             return
         new_miou = eval_metrics.get('mIoU', None)
+        new_macc = eval_metrics.get('mAcc', None)
         if new_miou is None:
             return
-        if new_miou > self.best_metric:
+        if new_miou > self.best_metric or (new_miou == self.best_metric and new_macc > self.best_macc):
             self.best_metric = new_miou
+            self.best_macc = new_macc
             self._save_best_checkpoint()
     
     def _is_iter_time(self, interval: int) -> bool:
@@ -228,6 +232,7 @@ class CustomTrainer:
         self.model.train() 
         
         for batch_idx, data_batch in enumerate(self.train_loader):
+            
             data_batch = {'img': data_batch['img'].data[0].cuda(), 'gt_semantic_seg': data_batch['gt_semantic_seg'].data[0].cuda(), 'img_metas': data_batch['img_metas'].data[0]}
             if self.rank == 0 and DEBUG == True:
                 print(f"img: {data_batch['img'].shape}")
@@ -237,24 +242,24 @@ class CustomTrainer:
             # Dynamic loss initialization and accumulation
             batch_losses = {}
             num_frames_in_batch = self.cfg.data.train.get('num_frames', 1)
-            self.optimizer.zero_grad()
+
             
             for t in range(num_frames_in_batch):
+                self.optimizer.zero_grad()
                 losses = self.model(**data_batch, step=t)
                 total_loss = 0.0
                 for key, value in losses.items():
                     if t == 0:
-                        batch_losses[key] = value.item() / num_frames_in_batch
+                        batch_losses[key] = value.item()
                     else:
-                        batch_losses[key] += value.item() / num_frames_in_batch
+                        batch_losses[key] += value.item()
                     total_loss += value
                 total_loss.backward()
-    
-            self.optimizer.step()
+                self.optimizer.step()
             self.lr_scheduler.step()
 
             # Multi-GPU averaging: automatically handle all metrics
-            metrics_values = [value for _, value in batch_losses.items()]
+            metrics_values = [value/num_frames_in_batch for _, value in batch_losses.items()]
             metrics_tensor = torch.tensor(metrics_values, device=self.device, dtype=torch.float32)
             metrics_tensor = self._reduce_mean(metrics_tensor)
             for i, (key, _) in enumerate(batch_losses.items()):
@@ -306,7 +311,7 @@ class CustomTrainer:
                     print(f"img_metas: {img_metas}")
                 
                 # Model inference with custom forward_test (sigmoid + threshold)
-                seg_preds = self.model.module.forward_test(imgs, img_metas, threshold=threshold)
+                seg_preds, confidence, points = self.model.module.forward_test(imgs, img_metas, threshold=threshold)
                 
                 # Get ground truths from dataset
                 batch_gts = []
@@ -331,8 +336,7 @@ class CustomTrainer:
         
         self.model.train()
         return eval_metrics
-    
-        
+       
     def save_checkpoint(self, is_best=False):
         """仅在is_best=True时保存best.pth；否则不保存。仅rank0执行。"""
         if self.rank != 0:

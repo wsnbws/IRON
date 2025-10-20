@@ -172,6 +172,8 @@ class MemoryEncoder(nn.Module):
         self.out_proj = nn.Identity()
         if out_dim != in_dim:
             self.out_proj = nn.Conv2d(in_dim, out_dim, kernel_size=1)
+        self.mask_scale = 20
+        self.mask_bias = -10
 
     def forward(
         self,
@@ -182,7 +184,8 @@ class MemoryEncoder(nn.Module):
         ## Process masks
         # sigmoid, so that less domain shift from gt masks which are bool
         if not skip_mask_sigmoid:
-            masks = torch.sigmoid(masks)
+            masks = torch.sigmoid(masks) * self.mask_scale + self.mask_bias
+
         # If spatial sizes already match, avoid downsampling; just project channels
         masks = self.mask_downsampler(masks)
 

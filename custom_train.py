@@ -73,6 +73,12 @@ def parse_args():
         help='作业启动器'
     )
     parser.add_argument('--local_rank', type=int, default=0)
+    parser.add_argument(
+        '--master-port',
+        type=int,
+        default=None,
+        help='分布式训练的主端口号'
+    )
     
     parser.add_argument(
         '--options', nargs='+', action=DictAction, help='自定义选项'

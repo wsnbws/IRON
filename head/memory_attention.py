@@ -39,17 +39,18 @@ def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.
 
     attn_weight = query @ key.transpose(-2, -1) * scale_factor
     attn_weight += attn_bias
-
-    # B, H, L, S_total = attn_weight.shape
-    # T = 4  
-    # S = S_total // T
-    # attn_weight = attn_weight.view(B, H, L, T, S)
-    # attn_weight = torch.softmax(attn_weight/0.7, dim=-1)
-    # attn_weight = attn_weight / attn_weight.sum(dim=(3,4), keepdim=True)  # 跨帧归一化
-    # attn_weight = attn_weight.view(B, H, L, S_total)
+    # if kargs.get("mode", None) == "cross_atten":
+    #     B, H, L, S_total = attn_weight.shape
+    #     T = 3  
+    #     S = S_total // T
+    #     attn_weight = attn_weight.view(B, H, L, T, S)
+    #     attn_weight = torch.softmax(attn_weight/0.7, dim=-1)
+    #     attn_weight = attn_weight / T
+    #     attn_weight = attn_weight.view(B, H, L, S_total)
+    # else:
     attn_weight = torch.softmax(attn_weight, dim=-1)
     if kargs.get("layer_id", None) is not None and TEST:
-        if kargs["layer_id"] == 5:
+        if kargs["layer_id"] == 3:
             save_atten = attn_weight.detach().cpu().numpy()
             np.save(f"/home/wangshuo/otdr/out/atten_weights/{kargs['basename']}_cross_attn_weight_{kargs['layer_id']}.npy", save_atten)
     attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
@@ -95,7 +96,7 @@ class Attention(nn.Module):
         x = x.transpose(1, 2)
         return x.reshape(b, n_tokens, n_heads * c_per_head)  # B x N_tokens x C
 
-    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+    def forward(self, q: Tensor, k: Tensor, v: Tensor, atten_mask=None) -> Tensor:
         # Input projections
         q = self.q_proj(q)
         k = self.k_proj(k)
@@ -108,7 +109,7 @@ class Attention(nn.Module):
 
         dropout_p = self.dropout_p if self.training else 0.0
         # Attention
-        out = scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        out = scaled_dot_product_attention(q, k, v, dropout_p=dropout_p, atten_mask=atten_mask)
         
         out = self._recombine_heads(out)
         out = self.out_proj(out)
@@ -193,19 +194,26 @@ class MemoryAttentionLayer(nn.Module):
     def __init__(
         self,
         activation: str = 'relu',
-        cross_attention: nn.Module = RoPEAttention(rope_k_repeat=True, kv_in_dim=64),
+        cross_attention: nn.Module = None,
         d_model: int=256,
         dim_feedforward: int =2048,
         dropout: float =0.1,
         pos_enc_at_attn: bool =True,
         pos_enc_at_cross_attn_keys: bool =True,
         pos_enc_at_cross_attn_queries: bool = True,
-        self_attention: nn.Module = RoPEAttention(),
+        self_attention: nn.Module = None,
     ):
         super().__init__()
         self.d_model = d_model
         self.dim_feedforward = dim_feedforward
         self.dropout_value = dropout
+        
+        # Initialize with default values if not provided
+        if self_attention is None:
+            self_attention = RoPEAttention()
+        if cross_attention is None:
+            cross_attention = RoPEAttention(rope_k_repeat=True, kv_in_dim=64)
+            
         self.self_attn = self_attention
         self.cross_attn_image = cross_attention
 
@@ -245,6 +253,7 @@ class MemoryAttentionLayer(nn.Module):
 
         # Cross-Attention
         tgt2 = self.norm2(tgt)
+        kargs["mode"] = "cross_atten"
         tgt2 = self.cross_attn_image(
             q=tgt2 + query_pos if self.pos_enc_at_cross_attn_queries else tgt2,
             k=memory + pos if self.pos_enc_at_cross_attn_keys else memory,
@@ -282,12 +291,17 @@ class MemoryAttention(nn.Module):
         self,
         d_model: int=256,
         pos_enc_at_input: bool=False,
-        layer: nn.Module=MemoryAttentionLayer(),
+        layer: nn.Module=None,
         num_layers: int=4,
         batch_first: bool = True,  # Do layers expect batch first input?
     ):
         super().__init__()
         self.d_model = d_model
+        
+        # Initialize with default values if not provided
+        if layer is None:
+            layer = MemoryAttentionLayer()
+            
         self.layers = get_clones(layer, num_layers)
         self.num_layers = num_layers
         self.norm = nn.LayerNorm(d_model)

@@ -404,12 +404,6 @@ class StatiConvMAE(nn.Module):
         #self.fpn = nn.MaxPool2d(kernel_size=2, stride=2)
         # Choose normalization for FPN based on availability of distributed process group
         use_sync = (fpn1_norm == 'SyncBN' and dist.is_available() and dist.is_initialized())
-        norm2d_cls = nn.SyncBatchNorm if use_sync else nn.BatchNorm2d
-        self.fpn = nn.Sequential(
-            nn.Conv2d(embed_dim[-1], embed_dim[-1], kernel_size=3, stride=2),
-            norm2d_cls(embed_dim[-1]),
-            nn.GELU(),
-            )
         # self.norm = norm_layer(embed_dim[-1])
 
         # NOTE as per official impl, we could have a pre-logits representation dense layer + tanh here
@@ -481,7 +475,6 @@ class StatiConvMAE(nn.Module):
         x = self.pos_drop(x)
         for blk in self.blocks1:
             x = blk(x)
-        features.append(x)
         x, _ = self.patch_embed2(x)
         for blk in self.blocks2:
             x = blk(x)
@@ -505,17 +498,18 @@ class StatiConvMAE(nn.Module):
             else:
                 x = x + self.pos_embed
         rel_pos_bias = self.rel_pos_bias() if self.rel_pos_bias is not None else None
-        for blk in self.blocks3:
+        for i, blk in enumerate(self.blocks3):
             if self.use_checkpoint and self.training:
                 x = checkpoint.checkpoint(blk, x, rel_pos_bias)
             else:
+                if i == 5:
+                    features.append(x.permute(0, 2, 1).reshape(B, -1, Hp, Wp))
                 x = blk(x, rel_pos_bias, hw=(Hp, Wp))
         # x = [bs,num_patches,embed_dim]
         # x = self.norm(x)
         x = x.permute(0, 2, 1).reshape(B, -1, Hp, Wp)
-        features.append(x.contiguous())
-        x = self.fpn(x)
         features.append(x)
+
         return tuple(features)
 
     def forward(self, x):
@@ -530,7 +524,11 @@ class StatiConvMAE(nn.Module):
         #                        max_samples=2, num_frames=nframes)
         #     self._debug_img_saved = True
         x = self.forward_features(x)
-        return x
+        target_sizes = [(128,128), (64,64), (32,32)]
+        upsampled = []
+        for feat, size in zip(x, target_sizes):
+            upsampled.append(F.interpolate(feat, size=size, mode='bilinear', align_corners=False))
+        return upsampled
 
 
 def _denorm_to_uint8(img_chw: torch.Tensor, mean: np.ndarray, std: np.ndarray, to_rgb: bool = True) -> np.ndarray:

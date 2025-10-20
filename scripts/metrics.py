@@ -83,11 +83,12 @@ class IncrementalMetrics:
         """
         eps = 1e-10
         
-        all_acc = self.total_area_intersect.sum() / (self.total_area_label.sum() + eps)
+        # Only compute metrics for drivable_area class (index 1)
+        dr_idx = 1
         acc_per_class = self.total_area_intersect / (self.total_area_label + eps)
         
         results = {
-            'aAcc': float(all_acc)
+            'aAcc': float(acc_per_class[dr_idx])
         }
         
         # Calculate per-class metrics for detailed logging
@@ -96,15 +97,13 @@ class IncrementalMetrics:
         for metric in self.metrics:
             if metric == 'mIoU':
                 iou_per_class = self.total_area_intersect / (self.total_area_union + eps)
-                mean_iou = np.nanmean(iou_per_class)
-                results['mIoU'] = float(mean_iou)
+                results['mIoU'] = float(iou_per_class[dr_idx])
                 per_class_metrics['IoU'] = iou_per_class
                 
             elif metric == 'mDice':
                 dice_per_class = (2 * self.total_area_intersect) / (
                     self.total_area_pred_label + self.total_area_label + eps)
-                mean_dice = np.nanmean(dice_per_class)
-                results['mDice'] = float(mean_dice)
+                results['mDice'] = float(dice_per_class[dr_idx])
                 per_class_metrics['Dice'] = dice_per_class
         
         # Log detailed per-class results

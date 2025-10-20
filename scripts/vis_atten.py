@@ -68,7 +68,7 @@ def extract_image_name(npy_file_path):
     """从.npy文件路径提取图片名称"""
     filename = os.path.basename(npy_file_path)
     # 移除 '_cross_attn_weight_3.npy' 后缀
-    image_name = filename.replace('_cross_attn_weight_5.npy', '')
+    image_name = filename.replace('_cross_attn_weight_3.npy', '')
     return image_name
 
 def find_image_path(image_name, base_dir):
@@ -264,4 +264,4 @@ if __name__ == "__main__":
     for i, (hist_img_path, attn_map) in enumerate(zip(history_images, attn_frames)):
         overlay_save_path = f"{output_dir}/overlays/patch_{patch_idx}_frame_T-{history_frames - i}_overlay.png"
         create_attention_overlay(hist_img_path, attn_map, overlay_save_path,
-                                 global_min=global_min, global_max=global_max)
+                                 )

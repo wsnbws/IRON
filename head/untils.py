@@ -189,13 +189,14 @@ def init_predictor_weights(predictor_module):
         init_conv_weights(module)
 
 
-def init_sam_weights(prompt_encoder, mask_decoder):
+def init_sam_weights(mask_decoder, prompt_encoder = None):
     """Initialize SAM decoder weights."""
     # Initialize prompt encoder
-    for module in prompt_encoder.modules():
-        init_linear_weights(module, init_type='xavier')
-        init_conv_weights(module)
-        init_embedding_weights(module)
+    if prompt_encoder is not None:
+        for module in prompt_encoder.modules():
+            init_linear_weights(module, init_type='xavier')
+            init_conv_weights(module)
+            init_embedding_weights(module)
         
     # Initialize mask decoder  
     for module in mask_decoder.modules():

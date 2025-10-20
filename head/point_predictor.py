@@ -4,9 +4,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
-from .memory_attention import Attention
-from timm.models.vision_transformer import Block
+from .memory_attention import Attention as MaskAttention
+from timm.models.vision_transformer import Block as TimmBlock
 from timm.models.vision_transformer import Mlp
+
+
+class MaskBlock(TimmBlock):
+
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+        super(MaskBlock).__init__(dim, num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop, attn_drop=attn_drop, drop_path=drop_path, act_layer=act_layer, norm_layer=norm_layer)
+        self.attn = MaskAttention(
+            dim, num_heads=num_heads, attn_drop=attn_drop)
+
+    def forward(self, x, atten_mask=None):
+        x = x + self.drop_path(self.attn(self.norm1(x), atten_mask))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
 
 
 class PointPredictor(nn.Module):
@@ -66,7 +80,7 @@ class PointPredictor(nn.Module):
         self.memory_proj = nn.Linear(memory_dim, self.unified_dim)
         self.current_proj = nn.Linear(current_dim, self.unified_dim)
         self.shared_self_attns = nn.ModuleList([
-            Block(
+            TimmBlock(
                 dim=self.unified_dim,
                 num_heads=num_heads,
                 mlp_ratio=4.0,
@@ -118,18 +132,20 @@ class PointPredictor(nn.Module):
     def process_memory_features(
         self,
         mem_features: torch.Tensor,
+        atten_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
             mem_features: (S, B, C=64) 
-            
+            atten_mask: (S, B) - optional bool mask, True for valid positions
         Returns:
             frame_agg_tokens: (B, T, num_agg_tokens, unified_dim) - content global tokens
         """
 
         S, B, C = mem_features.shape
         T = self.hist_queue_length
-        k = self.k if self.training else self.test_k
+        # k = self.k if self.training else self.test_k
+        k = S // T
         assert C == self.memory_dim, f"Expected memory_dim={self.memory_dim}, got {C}"
         assert S == T * k, f"S={S} should equal T*k={T}*{k}={T*k}"
         
@@ -140,13 +156,30 @@ class PointPredictor(nn.Module):
         frame_tokens = frame_specific_tokens.unsqueeze(0).expand(B, -1, -1, -1).contiguous().view(B * T, self.num_agg_tokens, self.unified_dim)
         combined_frames = torch.cat([frame_tokens, mem_features_proj], dim=1)  # (B*T, num_agg_tokens + k, unified_dim)
         
+        # Process attention mask if provided
+        combined_mask = None
+        if atten_mask is not None:
+            # atten_mask: (S, B) = (T*k, B)
+            # Reshape to (B, T, k) -> (B*T, k)
+            atten_mask_reshaped = atten_mask.transpose(0, 1).view(B, T, k).view(B * T, k)  # (B*T, k)
+            
+            # Create mask for aggregation tokens (always valid)
+            agg_mask = torch.ones(B * T, self.num_agg_tokens, dtype=torch.bool, device=atten_mask.device)  # (B*T, num_agg_tokens)
+            
+            # Combine: [agg_tokens_mask, memory_features_mask]
+            combined_mask = torch.cat([agg_mask, atten_mask_reshaped], dim=1)  # (B*T, num_agg_tokens + k)
+        
         for self_attn_block in self.shared_self_attns:
-            combined_frames = self_attn_block(combined_frames)  # (B*T, num_agg_tokens + k, unified_dim)
+            if combined_mask is not None:
+                combined_frames = self_attn_block(combined_frames, combined_mask)  # (B*T, num_agg_tokens + k, unified_dim)
+            else:
+                combined_frames = self_attn_block(combined_frames)  # (B*T, num_agg_tokens + k, unified_dim)
         frame_agg_tokens_flat = combined_frames[:, :self.num_agg_tokens, :]  # (B*T, num_agg_tokens, unified_dim)
         frame_agg_tokens = frame_agg_tokens_flat.view(B, T, self.num_agg_tokens, self.unified_dim)  # (B, T, num_agg_tokens, unified_dim)
         
         return frame_agg_tokens
-    
+
+
     def process_current_features(
         self,
         cur_features: torch.Tensor,
@@ -207,8 +240,8 @@ class PointPredictor(nn.Module):
         confidence = self.confidence_head(final_global_token)
         points_flat = self.point_regressor(final_global_token)  # (B, num_points * 2)
         points = points_flat.view(B, self.num_points, 2)  # (B, num_points, 2)
-        image_size = self.test_image_size if self.training else self.image_size
-        points = points * torch.tensor(list(self.image_size), device=points.device, dtype=points.dtype)
+        img_h, img_w = (self.image_size if self.training else self.test_image_size)
+        points = points * torch.tensor([img_w, img_h], device=points.device, dtype=points.dtype) 
         
         return final_global_token, confidence, points  # (B, unified_dim), (B, num_points), (B, num_points, 2)
 
