@@ -13,3 +13,5 @@ mmseg/
 
 # notebooks
 notebooks/
+
+configs/
