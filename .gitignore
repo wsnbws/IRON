@@ -3,6 +3,7 @@ data/
 
 # output
 out/
+out
 
 # mmseg
 mmseg/
