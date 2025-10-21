@@ -23,6 +23,7 @@ from .sam.transformer import TwoWayTransformer
 from .position_embed import PositionEmbeddingRandom
 from .flag import get_task_state
 from .psp_fpn import UPerHead
+from .flag import get_task_state
 
 @HEADS.register_module()
 class PredictiveTemporalUPerHead(nn.Module):
@@ -111,21 +112,21 @@ class PredictiveTemporalUPerHead(nn.Module):
             min_area_ratio=0.0,  # Minimum area ratio for valid targets
         )
         
-        self.hist_upscaling = nn.Sequential(
-            nn.ConvTranspose2d(
-                self.channels, self.channels, kernel_size=2, stride=2
-            ),
-            nn.SyncBatchNorm(self.channels),
-            nn.GELU(),
-            nn.ConvTranspose2d(
-                self.channels, self.channels, kernel_size=2, stride=2
-            ),
-            nn.SyncBatchNorm(self.channels),
-            nn.GELU(),
-        )
+        # self.hist_upscaling = nn.Sequential(
+        #     nn.ConvTranspose2d(
+        #         self.channels, self.channels, kernel_size=2, stride=2
+        #     ),
+        #     nn.SyncBatchNorm(self.channels),
+        #     nn.GELU(),
+        #     nn.ConvTranspose2d(
+        #         self.channels, self.channels, kernel_size=2, stride=2
+        #     ),
+        #     nn.SyncBatchNorm(self.channels),
+        #     nn.GELU(),
+        # )
         
-        # Project hist_feat from C channels to 1 channel for loss computation
-        self.hist_mask_proj = nn.Conv2d(self.channels, 1, kernel_size=3, padding=1)
+        # # Project hist_feat from C channels to 1 channel for loss computation
+        # self.hist_mask_proj = nn.Conv2d(self.channels, 1, kernel_size=3, padding=1)
 
 
 
@@ -148,10 +149,10 @@ class PredictiveTemporalUPerHead(nn.Module):
             
         init_sam_weights(self.mask_decoder)
         
-        # Initialize hist mask projection
-        nn.init.xavier_uniform_(self.hist_mask_proj.weight)
-        if self.hist_mask_proj.bias is not None:
-            nn.init.constant_(self.hist_mask_proj.bias, 0)
+        # # Initialize hist mask projection
+        # nn.init.xavier_uniform_(self.hist_mask_proj.weight)
+        # if self.hist_mask_proj.bias is not None:
+        #     nn.init.constant_(self.hist_mask_proj.bias, 0)
 
     def _build_sam_decoder(self):
 
@@ -250,9 +251,9 @@ class PredictiveTemporalUPerHead(nn.Module):
             **kargs
         )
         fus_feat = fus_feat.permute(1, 2, 0).reshape(B, C, H, W)  # Reshape back: (B, C, H, W)
-        hist_feat = hist_feat.permute(1, 2, 0).reshape(B, C, H, W)  # Reshape back: (B, C, H, W)
-        hist_feat = self.hist_upscaling(hist_feat)
-        hist_feat = self.hist_mask_proj(hist_feat)  # Project to 1 channel: (B, 1, H, W)
+        # hist_feat = hist_feat.permute(1, 2, 0).reshape(B, C, H, W)  # Reshape back: (B, C, H, W)
+        # hist_feat = self.hist_upscaling(hist_feat)
+        # hist_feat = self.hist_mask_proj(hist_feat)  # Project to 1 channel: (B, 1, H, W)
 
         masks_fine, masks_mid, masks_coarse = self.mask_decoder.forward(
             ori_embeddings = cur_features,
@@ -266,7 +267,7 @@ class PredictiveTemporalUPerHead(nn.Module):
 
         self.temporal_queue.push(cur_features, masks_fine)  # Store features and masks
 
-        return masks_fine, masks_mid, masks_coarse, hist_feat
+        return masks_fine, masks_mid, masks_coarse, None
     
     def forward_train(self, inputs, img_metas, gt_semantic_seg, t=0, timestamps: torch.Tensor = None):
         
@@ -276,7 +277,7 @@ class PredictiveTemporalUPerHead(nn.Module):
         losses = self.unified_loss(
             pred_masks=masks_list,  # Predicted mask logits: (B, 1, H, W)
             gt_semantic_seg=gt_semantic_seg,  # Ground truth masks: (B, 1, H_gt, W_gt)
-            target_class=1
+            target_class=get_task_state()
         )
         
         return losses

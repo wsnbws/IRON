@@ -232,7 +232,7 @@ class CustomTrainer:
         self.model.train() 
         
         for batch_idx, data_batch in enumerate(self.train_loader):
-            
+            switch_task_state()
             data_batch = {'img': data_batch['img'].data[0].cuda(), 'gt_semantic_seg': data_batch['gt_semantic_seg'].data[0].cuda(), 'img_metas': data_batch['img_metas'].data[0]}
             if self.rank == 0 and DEBUG == True:
                 print(f"img: {data_batch['img'].shape}")

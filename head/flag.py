@@ -1,5 +1,5 @@
 # globals_task.py
-TASK_STATE = 1  # 0 = 背景, 1 = 前景
+TASK_STATE = 0  # 0 = 背景, 1 = 前景
 TEST_TASK_STATE = 1  # 0 = 背景, 1 = 前景
 
 def switch_task_state():

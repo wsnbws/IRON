@@ -305,7 +305,7 @@ class MemoryAttention(nn.Module):
         self.layers = get_clones(layer, num_layers)
         self.num_layers = num_layers
         self.norm = nn.LayerNorm(d_model)
-        self.norm_cross = nn.LayerNorm(d_model)
+        # self.norm_cross = nn.LayerNorm(d_model)
         self.pos_enc_at_input = pos_enc_at_input
         self.batch_first = batch_first # (S, B, C) 转成 (B, S, C)
 
@@ -359,7 +359,7 @@ class MemoryAttention(nn.Module):
                 **kargs,
             )
         normed_output = self.norm(output)
-        normed_tmp_tgt = self.norm_cross(tmp_tgt)
+        normed_tmp_tgt = self.norm(tmp_tgt)
 
         if self.batch_first:
             # Convert back to seq first
