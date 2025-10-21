@@ -443,7 +443,7 @@ def load_checkpoint(model,
         pos_embed_checkpoint = state_dict['pos_embed']
         embedding_size = pos_embed_checkpoint.shape[-1]
         num_patches = model.patch_embed3.num_patches
-        num_extra_tokens = model.pos_embed.shape[-2] - num_patches
+        num_extra_tokens = model.pos_embed.shape[-2] - num_patches + 1
         # height (== width) for the checkpoint position embedding
         orig_size = int((pos_embed_checkpoint.shape[-2] - num_extra_tokens) ** 0.5)
         # height (== width) for the new position embedding
@@ -460,7 +460,7 @@ def load_checkpoint(model,
                 pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
             pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
             new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
-            state_dict['pos_embed'] = new_pos_embed
+            state_dict['pos_embed'] = pos_tokens
 
     # interpolate position bias table if needed
     relative_position_bias_table_keys = [k for k in state_dict.keys() if "relative_position_bias_table" in k]

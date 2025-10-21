@@ -122,7 +122,7 @@ class CustomTrainer:
         total_iters = batches_per_epoch * total_epochs
         self.total_iters = total_iters
         warmup_ratio = self.cfg.lr_config.get('warmup_ratio', 1e-6) if hasattr(self.cfg, 'lr_config') else 1e-6
-        warmup_iters = 250
+        warmup_iters = self.cfg.lr_config.get('warmup_iters')
         
         if self.rank == 0:
             self.logger.info(f"Dataset size: {num_train_data}")
