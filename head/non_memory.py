@@ -102,8 +102,8 @@ class MaskDecoder(nn.Module):
         b, c, h, w = src.shape
         hs, src = self.transformer(src, pos_src, tokens)
         mask_token_coarse  = hs[:, 0, :]
-        mask_token_mid = hs[:, 1, :]
-        mask_token_fine = hs[:, 2, :]
+        # mask_token_mid = hs[:, 1, :]
+        # mask_token_fine = hs[:, 2, :]
         src = src.transpose(1, 2).view(b, c, h, w) # (B, C, H, W)
 
         dc1, ln1, act1, dc2, act2 = self.output_upscaling

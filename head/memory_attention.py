@@ -13,7 +13,7 @@ from .untils import get_activation_fn, get_clones
 import torch.nn.functional as F
 from .position_embed import apply_rotary_enc, compute_axial_cis
 import numpy as np
-TEST = True
+TEST = False
 
 # Efficient implementation equivalent to the following:
 def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,

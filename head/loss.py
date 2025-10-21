@@ -258,18 +258,17 @@ class otdr_loss(nn.Module):
             fine_loss = self.compute_segmentation_loss(
                 mask_fine, gt_semantic_seg, target_class
             )
+
             mid_loss = self.compute_segmentation_loss(
                 mask_mid, F.interpolate(gt_semantic_seg.float(), scale_factor=(1/8), mode='nearest').long(), target_class
-            )
+            ) if mask_mid is not None else 0
             coarse_loss = self.compute_segmentation_loss(
                 mask_coarse, F.interpolate(gt_semantic_seg.float(), scale_factor=(4/512), mode='nearest').long(), target_class
-            )
-            if hist_feat is not None:
-                hist_loss = self.compute_segmentation_loss(
-                    hist_feat, gt_semantic_seg, target_class
-                )
-            else:
-                hist_loss = 0.0
+            ) if mask_coarse is not None else 0
+            hist_loss = self.compute_segmentation_loss(
+                hist_feat, gt_semantic_seg, target_class
+            ) if hist_feat is not None else 0
+
         else:   
             seg_loss = self.compute_segmentation_loss(
                 pred_masks, gt_semantic_seg, target_class
@@ -279,14 +278,13 @@ class otdr_loss(nn.Module):
             )
             
         
-        # Prepare detailed loss information
         loss_dict = {
-            # 'loss_point_cls': cls_loss * self.cls_weight,
-            # 'loss_point_reg': reg_loss * self.reg_weight,
-            'mask_coarse_loss': coarse_loss,
-            'mask_mid_loss': mid_loss,
             'mask_fine_loss': fine_loss,
         }
+        if mask_mid is not None:
+            loss_dict['mask_mid_loss'] = mid_loss
+        if mask_coarse is not None:
+            loss_dict['mask_coarse_loss'] = coarse_loss
         if hist_feat is not None:
             loss_dict['hist_loss'] = hist_loss
         
