@@ -121,8 +121,8 @@ class MaskDecoder(nn.Module):
 
         dc1, ln1, act1, dc2, act2 = self.output_upscaling
         feat_s0, feat_s1 = high_res_features
-        up_feat0 = src
-        up_feat1  = act1(ln1(dc1(up_feat0) + feat_s1))
+        up_feat0 = F.interpolate(src, scale_factor=(1/8), mode='bilinear', align_corners=False)
+        up_feat1  = act1(ln1(dc1(src) + feat_s1))
         up_feat2  = act2(dc2(up_feat1) + feat_s0)
 
         # Generate mask using hypernetwork
@@ -130,7 +130,8 @@ class MaskDecoder(nn.Module):
         hyper_in_mid = self.output_hypernetwork_mlps[1](mask_token_mid)  # (B, C)
         hyper_in_fine = self.output_hypernetwork_mlps[2](mask_token_fine)  # (B, C)
 
-        masks_coarse = (hyper_in_coarse.unsqueeze(1) @ up_feat0.view(b, c, -1)).view(b, 1, h, w)
+        masks_coarse = (hyper_in_coarse.unsqueeze(1) @ up_feat0.view(b, c, -1)).view(b, 1, *up_feat0.shape[-2:])
+        masks_coarse = F.interpolate(masks_coarse, scale_factor=8, mode='bilinear', align_corners=False)
         masks_mid = (hyper_in_mid.unsqueeze(1) @ self.coarse_up_mid(up_feat1, torch.sigmoid(masks_coarse)).view(b, c, -1)).view(b, 1, h*2, w*2)
         masks_fine = (hyper_in_fine.unsqueeze(1) @ self.mid_up_fine(up_feat2, torch.sigmoid(masks_mid)).view(b, c, -1)).view(b, 1, h*4, w*4)
 

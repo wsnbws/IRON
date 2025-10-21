@@ -250,20 +250,34 @@ class otdr_loss(nn.Module):
             gt_semantic_seg = gt_semantic_seg.unsqueeze(1)  # (B, 1, H, W)
             
         if isinstance(pred_masks, list) or isinstance(pred_masks, tuple):
-            mask_coarse, mask_mid, mask_fine = pred_masks
+            if len(pred_masks) == 3:
+                mask_fine, mask_mid, mask_coarse = pred_masks
+                hist_feat = None
+            else:
+                mask_fine, mask_mid, mask_coarse, hist_feat = pred_masks
             fine_loss = self.compute_segmentation_loss(
                 mask_fine, gt_semantic_seg, target_class
             )
             mid_loss = self.compute_segmentation_loss(
-                mask_mid, F.interpolate(gt_semantic_seg.float(), scale_factor=0.25, mode='nearest').long(), target_class
+                mask_mid, F.interpolate(gt_semantic_seg.float(), scale_factor=(1/8), mode='nearest').long(), target_class
             )
             coarse_loss = self.compute_segmentation_loss(
-                mask_coarse, F.interpolate(gt_semantic_seg.float(), scale_factor=0.125, mode='nearest').long(), target_class
+                mask_coarse, F.interpolate(gt_semantic_seg.float(), scale_factor=(4/512), mode='nearest').long(), target_class
             )
+            if hist_feat is not None:
+                hist_loss = self.compute_segmentation_loss(
+                    hist_feat, gt_semantic_seg, target_class
+                )
+            else:
+                hist_loss = 0.0
         else:   
             seg_loss = self.compute_segmentation_loss(
                 pred_masks, gt_semantic_seg, target_class
             )
+            hist_loss = self.compute_segmentation_loss(
+                hist_feat, gt_semantic_seg, target_class
+            )
+            
         
         # Prepare detailed loss information
         loss_dict = {
@@ -273,5 +287,7 @@ class otdr_loss(nn.Module):
             'mask_mid_loss': mid_loss,
             'mask_fine_loss': fine_loss,
         }
+        if hist_feat is not None:
+            loss_dict['hist_loss'] = hist_loss
         
         return loss_dict

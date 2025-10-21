@@ -110,7 +110,24 @@ class PredictiveTemporalUPerHead(nn.Module):
             normalize_by_image_size=False,  # Normalize coordinates by image size
             min_area_ratio=0.0,  # Minimum area ratio for valid targets
         )
-        self.point_prompt_threshold = 0.5  # Confidence threshold for point prompts
+        
+        self.hist_upscaling = nn.Sequential(
+            nn.ConvTranspose2d(
+                self.channels, self.channels, kernel_size=2, stride=2
+            ),
+            nn.SyncBatchNorm(self.channels),
+            nn.GELU(),
+            nn.ConvTranspose2d(
+                self.channels, self.channels, kernel_size=2, stride=2
+            ),
+            nn.SyncBatchNorm(self.channels),
+            nn.GELU(),
+        )
+        
+        # Project hist_feat from C channels to 1 channel for loss computation
+        self.hist_mask_proj = nn.Conv2d(self.channels, 1, kernel_size=3, padding=1)
+
+
 
     def init_weights(self):
         """Initialize weights for all components using utils functions."""
@@ -130,6 +147,11 @@ class PredictiveTemporalUPerHead(nn.Module):
             init_encoder_weights(self.memory_encoder)
             
         init_sam_weights(self.mask_decoder)
+        
+        # Initialize hist mask projection
+        nn.init.xavier_uniform_(self.hist_mask_proj.weight)
+        if self.hist_mask_proj.bias is not None:
+            nn.init.constant_(self.hist_mask_proj.bias, 0)
 
     def _build_sam_decoder(self):
 
@@ -219,7 +241,7 @@ class PredictiveTemporalUPerHead(nn.Module):
         base_mem_features, base_pos_enc, batch_masks = self._get_memory_base(cur_features, t, timestamps)
         memory_enc_full, mem_features_full = self._format_memory_full(base_mem_features, base_pos_enc, B)
         
-        fus_feat, _ = self.memory_attention(
+        fus_feat, hist_feat = self.memory_attention(
             cur_features_seq,  # Current frame queries: (H*W, B, C)
             mem_features_full,  # Full historical memory: (T*H*W, B, C)
             cur_pos_enc_seq,  # Current position encodings: (H*W, B, C)
@@ -228,6 +250,9 @@ class PredictiveTemporalUPerHead(nn.Module):
             **kargs
         )
         fus_feat = fus_feat.permute(1, 2, 0).reshape(B, C, H, W)  # Reshape back: (B, C, H, W)
+        hist_feat = hist_feat.permute(1, 2, 0).reshape(B, C, H, W)  # Reshape back: (B, C, H, W)
+        hist_feat = self.hist_upscaling(hist_feat)
+        hist_feat = self.hist_mask_proj(hist_feat)  # Project to 1 channel: (B, 1, H, W)
 
         masks_fine, masks_mid, masks_coarse = self.mask_decoder.forward(
             ori_embeddings = cur_features,
@@ -241,7 +266,7 @@ class PredictiveTemporalUPerHead(nn.Module):
 
         self.temporal_queue.push(cur_features, masks_fine)  # Store features and masks
 
-        return masks_fine, masks_mid, masks_coarse
+        return masks_fine, masks_mid, masks_coarse, hist_feat
     
     def forward_train(self, inputs, img_metas, gt_semantic_seg, t=0, timestamps: torch.Tensor = None):
         
@@ -286,7 +311,7 @@ class PredictiveTemporalUPerHead(nn.Module):
 
         # Convert timestamps to tensor and perform forward pass
         ts_tensor = torch.tensor([self.temporal_time_test_queue], dtype=torch.float32)  # (1, history_length+1)
-        final_output, _, _ = self._forward_stream_batch(
+        final_output, _, _, hist_feat = self._forward_stream_batch(
             inputs, t_val, timestamps=ts_tensor, basename=basename
         )
         return final_output, None, None# (B, 1, H_out, W_out)

@@ -20,6 +20,7 @@ from mmseg import __version__
 from mmseg.apis import set_random_seed
 from mmseg.utils import collect_env, get_root_logger
 from custom_trainer import CustomTrainer
+from static_train import CustomTrainer as StaticTrainer
 import backbone
 import dataset
 import head
@@ -87,6 +88,11 @@ def parse_args():
         '--no-validate',
         action='store_true',
         help='训练期间不进行验证'
+    )
+    parser.add_argument(
+        '--static',
+        action='store_true',
+        default=False,
     )
     
     args = parser.parse_args()
@@ -188,11 +194,18 @@ def main():
         
     logger.info(f'Rank: {rank}, World Size: {world_size}, Local Rank: {local_rank}')
     
-    trainer = CustomTrainer(
-        cfg=cfg,
-        distributed=distributed,
-        local_rank=local_rank
-    )
+    if args.static:
+        trainer = StaticTrainer(
+            cfg=cfg,
+            distributed=distributed,
+            local_rank=local_rank
+        )
+    else:
+        trainer = CustomTrainer(
+            cfg=cfg,
+            distributed=distributed,
+            local_rank=local_rank
+        )
 
     try:
         trainer.train(
