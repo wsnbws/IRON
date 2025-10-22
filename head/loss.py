@@ -250,15 +250,11 @@ class otdr_loss(nn.Module):
             gt_semantic_seg = gt_semantic_seg.unsqueeze(1)  # (B, 1, H, W)
             
         if isinstance(pred_masks, list) or isinstance(pred_masks, tuple):
-            if len(pred_masks) == 3:
-                mask_fine, mask_mid, mask_coarse = pred_masks
-                hist_feat = None
-            else:
-                mask_fine, mask_mid, mask_coarse, hist_feat = pred_masks
+
+            mask_fine, mask_mid, mask_coarse, hist_feat, mask_empty = pred_masks
             fine_loss = self.compute_segmentation_loss(
                 mask_fine, gt_semantic_seg, target_class
             )
-
             mid_loss = self.compute_segmentation_loss(
                 mask_mid, F.interpolate(gt_semantic_seg.float(), scale_factor=(1/8), mode='nearest').long(), target_class
             ) if mask_mid is not None else 0
@@ -268,7 +264,7 @@ class otdr_loss(nn.Module):
             hist_loss = self.compute_segmentation_loss(
                 hist_feat, gt_semantic_seg, target_class
             ) if hist_feat is not None else 0
-
+            empty_loss = F.sigmoid(mask_empty).mean()
         else:   
             seg_loss = self.compute_segmentation_loss(
                 pred_masks, gt_semantic_seg, target_class
@@ -287,5 +283,6 @@ class otdr_loss(nn.Module):
             loss_dict['mask_coarse_loss'] = coarse_loss
         if hist_feat is not None:
             loss_dict['hist_loss'] = hist_loss
-        
+        if mask_empty is not None:
+            loss_dict['empty_loss'] = empty_loss
         return loss_dict

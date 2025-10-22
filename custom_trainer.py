@@ -246,7 +246,7 @@ class CustomTrainer:
             
             for t in range(num_frames_in_batch):
                 self.optimizer.zero_grad()
-                losses = self.model(**data_batch, step=t)
+                losses = self.model(**data_batch, step=t, current_iter={"now": self.current_iter, "total": self.total_iters})
                 total_loss = 0.0
                 for key, value in losses.items():
                     if t == 0:

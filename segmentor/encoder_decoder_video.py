@@ -127,7 +127,7 @@ class EncoderDecoderVideo(BaseSegmentor):
         
         return batch_timestamps
 
-    def _decode_head_forward_train(self, x, img_metas, gt_semantic_seg, t=None):
+    def _decode_head_forward_train(self, x, img_metas, gt_semantic_seg, t=None, current_iter=None):
         """Run forward function and calculate loss for decode head in
         training."""
         losses = dict()
@@ -137,7 +137,8 @@ class EncoderDecoderVideo(BaseSegmentor):
         loss_decode = self.decode_head.forward_train(x, img_metas,
                                                         gt_semantic_seg,
                                                         t=t,
-                                                        timestamps=ts_tensor)
+                                                        timestamps=ts_tensor,
+                                                        current_iter=current_iter)
 
         losses.update(add_prefix(loss_decode, 'decode'))
         return losses
@@ -167,7 +168,7 @@ class EncoderDecoderVideo(BaseSegmentor):
 
         return losses
 
-    def forward_train(self, img, img_metas, gt_semantic_seg, step):
+    def forward_train(self, img, img_metas, gt_semantic_seg, step, current_iter):
 
         final_losses = dict()
         
@@ -193,7 +194,7 @@ class EncoderDecoderVideo(BaseSegmentor):
         gt_t = gtn[:, step].unsqueeze(1)
 
         # 因为特征已经过 FPN+PSP 处理，所以传入 skip_fpn_psp=True
-        loss_decode_t = self._decode_head_forward_train(img_feature, img_metas, gt_t, t=step)
+        loss_decode_t = self._decode_head_forward_train(img_feature, img_metas, gt_t, t=step, current_iter=current_iter)
         for k, v in loss_decode_t.items():
             final_losses[k] = final_losses.get(k, 0) + v
 

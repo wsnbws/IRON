@@ -121,4 +121,18 @@ class MaskDecoder(nn.Module):
         b, c, h, w = upscaled_embedding.shape
         masks = (hyper_in.unsqueeze(1) @ upscaled_embedding.view(b, c, h * w)).view(b, 1, h, w)
 
-        return masks, None, None
+
+        tokens, src = output_tokens, ori_embeddings
+        b, c, h, w = src.shape
+        hs, src = self.transformer(src, pos_src, tokens)
+        mask_token_out = hs[:, 0, :]               # (B, C)
+        src = src.transpose(1, 2).view(b, c, h, w)
+        dc1, ln1, act1, dc2, act2 = self.output_upscaling
+        feat_s0, feat_s1 = high_res_features
+        upscaled_embedding = act1(ln1(dc1(src) + 0*feat_s1))
+        upscaled_embedding = act2(dc2(upscaled_embedding) + 0*feat_s0)
+        hyper_in = self.output_hypernetwork_mlp(mask_token_out)  #
+        b, c, h, w = upscaled_embedding.shape
+        empty_masks = (hyper_in.unsqueeze(1) @ upscaled_embedding.view(b, c, h * w)).view(b, 1, h, w)
+
+        return masks, None, None, empty_masks

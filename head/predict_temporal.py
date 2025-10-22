@@ -2,9 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import os
+import numpy as np
 import re
 from typing import Optional, Tuple
-
+import math
 from mmseg.ops import resize
 from mmseg.models.builder import HEADS
 from mmcv.cnn import ConvModule
@@ -211,7 +212,7 @@ class PredictiveTemporalUPerHead(nn.Module):
         batch_time_enc = batch_time_enc.expand(-1, -1, *historical_frames.shape[3:])
 
         # Encode memory features
-        batch_memory_output = self.memory_encoder(batch_frames, batch_masks)
+        batch_memory_output = self.memory_encoder(batch_frames, batch_masks, skip_mask_sigmoid=True)
         mem_features = batch_memory_output["vision_features"]
         batch_pos_enc = batch_memory_output["vision_pos_enc"]
         batch_pos_enc = batch_pos_enc + batch_time_enc
@@ -255,7 +256,7 @@ class PredictiveTemporalUPerHead(nn.Module):
         # hist_feat = self.hist_upscaling(hist_feat)
         # hist_feat = self.hist_mask_proj(hist_feat)  # Project to 1 channel: (B, 1, H, W)
 
-        masks_fine, masks_mid, masks_coarse = self.mask_decoder.forward(
+        masks_fine, masks_mid, masks_coarse, masks_empty = self.mask_decoder.forward(
             ori_embeddings = cur_features,
             image_embeddings=fus_feat,  # Fused features: (B, C, H, W)
             image_pe=self.pe_layer(self.sam_prompt_image_embedding_size if self.training else self.sam_prompt_test_image_embedding_size).unsqueeze(0),  # Dense position encodings: (1, C, H, W)
@@ -264,15 +265,28 @@ class PredictiveTemporalUPerHead(nn.Module):
             high_res_features=fpn_outs[:-1],  # High-resolution features (empty for now),
             step=t
         )
+        
+        if self.training:
+            use_pred_prob = self.sigmoid_schedule(kargs["current_iter"]["now"], kargs["current_iter"]["total"])
+            use_pred = np.random.rand(1) < use_pred_prob
+            gt_seg = kargs["gt_seg"].to(dtype=torch.float32)
+            gt_mask = F.interpolate(gt_seg if get_task_state() == 1 else (1- gt_seg), scale_factor=0.25, mode='bilinear', align_corners=False)
+            mask2push = F.sigmoid(masks_fine) if use_pred else gt_mask
+            self.temporal_queue.push(cur_features, mask2push)  # Store features and masks
+        else:
+            self.temporal_queue.push(cur_features, F.sigmoid(masks_fine))  # Store features and masks
 
-        self.temporal_queue.push(cur_features, masks_fine)  # Store features and masks
-
-        return masks_fine, masks_mid, masks_coarse, None
+        return masks_fine, masks_mid, masks_coarse, None, masks_empty
     
-    def forward_train(self, inputs, img_metas, gt_semantic_seg, t=0, timestamps: torch.Tensor = None):
+    def sigmoid_schedule(self, step, total_steps, k=10):
+        # x = (step / total_steps) * 2 - 1  # [-1, 1] 范围
+        # return 1 / (1 + math.exp(-k * x))  # 输出 [0,1]
+        return step / total_steps
+    
+    def forward_train(self, inputs, img_metas, gt_semantic_seg, t=0, timestamps: torch.Tensor = None, current_iter=None):
         
         masks_list = self._forward_stream_batch(
-            inputs, t, timestamps=timestamps
+            inputs, t, timestamps=timestamps, gt_seg = gt_semantic_seg, current_iter=current_iter
         )
         losses = self.unified_loss(
             pred_masks=masks_list,  # Predicted mask logits: (B, 1, H, W)
@@ -312,7 +326,7 @@ class PredictiveTemporalUPerHead(nn.Module):
 
         # Convert timestamps to tensor and perform forward pass
         ts_tensor = torch.tensor([self.temporal_time_test_queue], dtype=torch.float32)  # (1, history_length+1)
-        final_output, _, _, hist_feat = self._forward_stream_batch(
+        final_output, _, _, hist_feat,_ = self._forward_stream_batch(
             inputs, t_val, timestamps=ts_tensor, basename=basename
         )
         return final_output, None, None# (B, 1, H_out, W_out)
