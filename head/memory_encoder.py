@@ -183,8 +183,7 @@ class MemoryEncoder(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         ## Process masks
         # sigmoid, so that less domain shift from gt masks which are bool
-        if not skip_mask_sigmoid:
-            masks = torch.sigmoid(masks) * self.mask_scale + self.mask_bias
+        masks = torch.sigmoid(masks) * self.mask_scale + self.mask_bias if not skip_mask_sigmoid else masks * self.mask_scale + self.mask_bias
 
         # If spatial sizes already match, avoid downsampling; just project channels
         masks = self.mask_downsampler(masks)
