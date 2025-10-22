@@ -10,9 +10,11 @@ from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 import torch
 import torch.nn.init
 from torch import Tensor, nn
-
 from .layers import LayerScale, Mlp, PatchEmbed, RMSNorm, RopePositionEmbedding, SelfAttentionBlock, SwiGLUFFN
 from .utils import named_apply
+from mmseg.models.builder import BACKBONES
+from mmseg.utils import get_root_logger
+from mmcv_custom import load_checkpoint
 
 logger = logging.getLogger("dinov3")
 
@@ -55,7 +57,7 @@ def init_weights_vit(module: nn.Module, name: str = ""):
     if isinstance(module, RMSNorm):
         module.reset_parameters()
 
-
+@BACKBONES.register_module()
 class DinoVisionTransformer(nn.Module):
     def __init__(
         self,
@@ -340,90 +342,3 @@ class DinoVisionTransformer(nn.Module):
             return ret
         else:
             return self.head(ret["x_norm_clstoken"])
-
-
-def vit_small(patch_size=16, **kwargs):
-    model = DinoVisionTransformer(
-        patch_size=patch_size,
-        embed_dim=384,
-        depth=12,
-        num_heads=6,
-        ffn_ratio=4,
-        **kwargs,
-    )
-    return model
-
-
-def vit_base(patch_size=16, **kwargs):
-    model = DinoVisionTransformer(
-        patch_size=patch_size,
-        embed_dim=768,
-        depth=12,
-        num_heads=12,
-        ffn_ratio=4,
-        **kwargs,
-    )
-    return model
-
-
-def vit_large(patch_size=16, **kwargs):
-    model = DinoVisionTransformer(
-        patch_size=patch_size,
-        embed_dim=1024,
-        depth=24,
-        num_heads=16,
-        ffn_ratio=4,
-        **kwargs,
-    )
-    return model
-
-
-def vit_so400m(patch_size=16, **kwargs):
-    model = DinoVisionTransformer(
-        patch_size=patch_size,
-        embed_dim=1152,
-        depth=27,
-        num_heads=18,
-        ffn_ratio=3.777777778,
-        **kwargs,
-    )
-    return model
-
-
-def vit_huge2(patch_size=16, **kwargs):
-    model = DinoVisionTransformer(
-        patch_size=patch_size,
-        embed_dim=1280,
-        depth=32,
-        num_heads=20,
-        ffn_ratio=4,
-        **kwargs,
-    )
-    return model
-
-
-def vit_giant2(patch_size=16, **kwargs):
-    """
-    Close to ViT-giant, with embed-dim 1536 and 24 heads => embed-dim per head 64
-    """
-    model = DinoVisionTransformer(
-        patch_size=patch_size,
-        embed_dim=1536,
-        depth=40,
-        num_heads=24,
-        ffn_ratio=4,
-        **kwargs,
-    )
-    return model
-
-
-def vit_7b(patch_size=16, **kwargs):
-    model = DinoVisionTransformer(
-        patch_size=patch_size,
-        embed_dim=4096,
-        depth=40,
-        num_heads=32,
-        ffn_ratio=3,
-        **kwargs,
-    )
-    return model

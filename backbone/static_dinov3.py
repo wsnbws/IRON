@@ -13,7 +13,7 @@ from .dino_3.dinov3 import (
 )
 
 
-@BACKBONES.register_module()
+
 class StaticDINOv3(nn.Module):
     """Static DINOv3 backbone for semantic segmentation.
     
@@ -168,29 +168,4 @@ class StaticDINOv3(nn.Module):
         if self.freeze_backbone:
             self.dino_model.eval()
         return self
-
-
-# Convenience functions to create specific model sizes
-@BACKBONES.register_module()
-class DINOv3Small(StaticDINOv3):
-    def __init__(self, **kwargs):
-        super().__init__(model_name='small', **kwargs)
-
-
-@BACKBONES.register_module()
-class DINOv3Base(StaticDINOv3):
-    def __init__(self, **kwargs):
-        super().__init__(model_name='base', **kwargs)
-
-
-@BACKBONES.register_module()
-class DINOv3Large(StaticDINOv3):
-    def __init__(self, **kwargs):
-        super().__init__(model_name='large', **kwargs)
-
-
-@BACKBONES.register_module()
-class DINOv3Giant(StaticDINOv3):
-    def __init__(self, **kwargs):
-        super().__init__(model_name='giant2', **kwargs)
 
