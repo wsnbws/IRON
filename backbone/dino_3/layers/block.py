@@ -3,7 +3,7 @@
 # This software may be used and distributed in accordance with
 # the terms of the DINOv3 License Agreement.
 
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import torch
 from torch import Tensor, nn
@@ -14,8 +14,8 @@ from .attention import CausalSelfAttention, SelfAttention
 from .ffn_layers import Mlp
 from .layer_scale import LayerScale  # , DropPath
 
-torch._dynamo.config.automatic_dynamic_shapes = False
-torch._dynamo.config.accumulated_cache_size_limit = 1024
+# torch._dynamo.config.automatic_dynamic_shapes = False
+# torch._dynamo.config.accumulated_cache_size_limit = 1024
 
 
 class SelfAttentionBlock(nn.Module):
@@ -68,7 +68,7 @@ class SelfAttentionBlock(nn.Module):
         self.sample_drop_ratio = drop_path
 
     @staticmethod
-    def _maybe_index_rope(rope: tuple[Tensor, Tensor] | None, indices: Tensor) -> tuple[Tensor, Tensor] | None:
+    def _maybe_index_rope(rope: Optional[Tuple[Tensor, Tensor]], indices: Tensor) -> Optional[Tuple[Tensor, Tensor]]:
         if rope is None:
             return None
 
@@ -97,12 +97,12 @@ class SelfAttentionBlock(nn.Module):
             rope_subset = self._maybe_index_rope(rope, indices_1)
             residual_1 = self.attn(self.norm1(x_subset_1), rope=rope_subset)
 
+            # PyTorch 1.8 compatibility: index_add doesn't support alpha parameter
             x_attn = torch.index_add(
                 x,
                 dim=0,
-                source=self.ls1(residual_1),
+                source=self.ls1(residual_1) * residual_scale_factor,
                 index=indices_1,
-                alpha=residual_scale_factor,
             )
 
             indices_2 = (torch.randperm(b, device=x.device))[:sample_subset_size]
@@ -110,12 +110,12 @@ class SelfAttentionBlock(nn.Module):
             x_subset_2 = x_attn[indices_2]
             residual_2 = self.mlp(self.norm2(x_subset_2))
 
+            # PyTorch 1.8 compatibility: index_add doesn't support alpha parameter
             x_ffn = torch.index_add(
                 x_attn,
                 dim=0,
-                source=self.ls2(residual_2),
+                source=self.ls2(residual_2) * residual_scale_factor,
                 index=indices_2,
-                alpha=residual_scale_factor,
             )
         else:
             x_attn = x + self.ls1(self.attn(self.norm1(x), rope=rope))
@@ -151,13 +151,13 @@ class SelfAttentionBlock(nn.Module):
             norm1 = uncat_with_shapes(self.norm1(flattened), shapes, num_tokens)
             residual_1_list = self.attn.forward_list(norm1, rope_list=rope_subset_list)
 
+            # PyTorch 1.8 compatibility: index_add doesn't support alpha parameter
             x_attn_list = [
                 torch.index_add(
                     x,
                     dim=0,
-                    source=self.ls1(residual_1),
+                    source=self.ls1(residual_1) * residual_scale_factor,
                     index=indices_1,
-                    alpha=residual_scale_factor,
                 )
                 for x, residual_1, indices_1, residual_scale_factor in zip(
                     x_list, residual_1_list, indices_1_list, residual_scale_factors
@@ -175,13 +175,13 @@ class SelfAttentionBlock(nn.Module):
 
             residual_2_list = self.mlp.forward_list(norm2_list)
 
+            # PyTorch 1.8 compatibility: index_add doesn't support alpha parameter
             x_ffn = [
                 torch.index_add(
                     x_attn,
                     dim=0,
-                    source=self.ls2(residual_2),
+                    source=self.ls2(residual_2) * residual_scale_factor,
                     index=indices_2,
-                    alpha=residual_scale_factor,
                 )
                 for x_attn, residual_2, indices_2, residual_scale_factor in zip(
                     x_attn_list, residual_2_list, indices_2_list, residual_scale_factors
@@ -245,9 +245,9 @@ class CausalSelfAttentionBlock(nn.Module):
 
     def init_weights(
         self,
-        init_attn_std: float | None = None,
-        init_proj_std: float | None = None,
-        init_fc_std: float | None = None,
+        init_attn_std: Optional[float] = None,
+        init_proj_std: Optional[float] = None,
+        init_fc_std: Optional[float] = None,
         factor: float = 1.0,
     ) -> None:
         init_attn_std = init_attn_std or (self.dim**-0.5)

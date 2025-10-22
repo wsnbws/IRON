@@ -35,9 +35,9 @@ class Mlp(nn.Module, ListForwardMixin):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features, bias=bias, device=device)
+        self.fc1 = nn.Linear(in_features, hidden_features, bias=bias)  # PyTorch 1.8: no device param
         self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias, device=device)
+        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias)  # PyTorch 1.8: no device param
         self.drop = nn.Dropout(drop)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -66,9 +66,9 @@ class SwiGLUFFN(nn.Module, ListForwardMixin):
         hidden_features = hidden_features or in_features
         d = int(hidden_features * 2 / 3)
         swiglu_hidden_features = d + (-d % align_to)
-        self.w1 = nn.Linear(in_features, swiglu_hidden_features, bias=bias, device=device)
-        self.w2 = nn.Linear(in_features, swiglu_hidden_features, bias=bias, device=device)
-        self.w3 = nn.Linear(swiglu_hidden_features, out_features, bias=bias, device=device)
+        self.w1 = nn.Linear(in_features, swiglu_hidden_features, bias=bias)  # PyTorch 1.8: no device param
+        self.w2 = nn.Linear(in_features, swiglu_hidden_features, bias=bias)  # PyTorch 1.8: no device param
+        self.w3 = nn.Linear(swiglu_hidden_features, out_features, bias=bias)  # PyTorch 1.8: no device param
 
     def forward(self, x: Tensor) -> Tensor:
         x1 = self.w1(x)

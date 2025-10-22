@@ -4,7 +4,7 @@
 # the terms of the DINOv3 License Agreement.
 
 import math
-from typing import Literal
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -19,15 +19,15 @@ class RopePositionEmbedding(nn.Module):
         embed_dim: int,
         *,
         num_heads: int,
-        base: float | None = 100.0,
-        min_period: float | None = None,
-        max_period: float | None = None,
-        normalize_coords: Literal["min", "max", "separate"] = "separate",
-        shift_coords: float | None = None,
-        jitter_coords: float | None = None,
-        rescale_coords: float | None = None,
-        dtype: torch.dtype | None = None,
-        device: torch.device | None = None,
+        base: Optional[float] = 100.0,
+        min_period: Optional[float] = None,
+        max_period: Optional[float] = None,
+        normalize_coords: str = "separate",
+        shift_coords: Optional[float] = None,
+        jitter_coords: Optional[float] = None,
+        rescale_coords: Optional[float] = None,
+        dtype: Optional[torch.dtype] = None,
+        device: Optional[torch.device] = None,
     ):
         super().__init__()
         assert embed_dim % (4 * num_heads) == 0
@@ -54,10 +54,12 @@ class RopePositionEmbedding(nn.Module):
         )
         self._init_weights()
 
-    def forward(self, *, H: int, W: int) -> tuple[Tensor, Tensor]:
+    def forward(self, *, H: int, W: int) -> Tuple[Tensor, Tensor]:
         device = self.periods.device
         dtype = self.dtype
-        dd = {"device": device, "dtype": dtype}
+        # PyTorch 1.8 compatibility: arange/empty don't support bfloat16, use float32 first
+        compute_dtype = torch.float32
+        dd = {"device": device, "dtype": compute_dtype}
 
         # Prepare coords in range [-1, +1]
         if self.normalize_coords == "max":
@@ -73,7 +75,9 @@ class RopePositionEmbedding(nn.Module):
             coords_w = torch.arange(0.5, W, **dd) / W  # [W]
         else:
             raise ValueError(f"Unknown normalize_coords: {self.normalize_coords}")
-        coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing="ij"), dim=-1)  # [H, W, 2]
+        # PyTorch 1.8 compatibility: meshgrid doesn't support indexing parameter
+        grid_h, grid_w = torch.meshgrid(coords_h, coords_w)
+        coords = torch.stack([grid_h, grid_w], dim=-1)  # [H, W, 2]
         coords = coords.flatten(0, 1)  # [HW, 2]
         coords = 2.0 * coords - 1.0  # Shift range [0, 1] to [-1, +1]
 
@@ -99,23 +103,36 @@ class RopePositionEmbedding(nn.Module):
         # Prepare angles and sin/cos
         angles = 2 * math.pi * coords[:, :, None] / self.periods[None, None, :]  # [HW, 2, D//4]
         angles = angles.flatten(1, 2)  # [HW, D//2]
-        angles = angles.tile(2)  # [HW, D]
+        # PyTorch 1.8 compatibility: use repeat instead of tile
+        angles = angles.repeat(1, 2)  # [HW, D]
         cos = torch.cos(angles)  # [HW, D]
         sin = torch.sin(angles)  # [HW, D]
+        
+        # Convert back to target dtype if needed
+        if dtype is not None and dtype != compute_dtype:
+            sin = sin.to(dtype)
+            cos = cos.to(dtype)
 
         return (sin, cos)  # 2 * [HW, D]
 
     def _init_weights(self):
         device = self.periods.device
         dtype = self.dtype
+        # PyTorch 1.8 compatibility: arange/linspace don't support bfloat16, create in float32 first
+        compute_dtype = torch.float32
+        
         if self.base is not None:
             periods = self.base ** (
-                2 * torch.arange(self.D_head // 4, device=device, dtype=dtype) / (self.D_head // 2)
+                2 * torch.arange(self.D_head // 4, device=device, dtype=compute_dtype) / (self.D_head // 2)
             )  # [D//4]
         else:
             base = self.max_period / self.min_period
-            exponents = torch.linspace(0, 1, self.D_head // 4, device=device, dtype=dtype)  # [D//4] range [0, 1]
+            exponents = torch.linspace(0, 1, self.D_head // 4, device=device, dtype=compute_dtype)  # [D//4] range [0, 1]
             periods = base**exponents  # range [1, max_period / min_period]
             periods = periods / base  # range [min_period / max_period, 1]
             periods = periods * self.max_period  # range [min_period, max_period]
+        
+        # Convert to target dtype if different
+        if dtype is not None and dtype != compute_dtype:
+            periods = periods.to(dtype)
         self.periods.data = periods

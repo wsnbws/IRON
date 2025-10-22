@@ -4,14 +4,43 @@
 # the terms of the DINOv3 License Agreement.
 
 import math
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Union
 
 import torch
 import torch.nn.functional as F
 from ..utils import cat_keep_shapes, uncat_with_shapes
 from torch import Tensor, nn
 
+# Efficient implementation for PyTorch 1.8 compatibility (replacement for torch.nn.functional.scaled_dot_product_attention)
+def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,
+        is_causal=False, scale=None, enable_gqa=False) -> torch.Tensor:
+    L, S = query.size(-2), key.size(-2)
+    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
+    attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
+    if is_causal:
+        assert attn_mask is None
+        temp_mask = torch.ones(L, S, dtype=torch.bool, device=query.device).tril(diagonal=0)
+        # PyTorch 1.8 compatibility: use ~ instead of .logical_not()
+        attn_bias.masked_fill_(~temp_mask, float("-inf"))
 
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            # PyTorch 1.8 compatibility: use ~ instead of .logical_not()
+            attn_bias.masked_fill_(~attn_mask, float("-inf"))
+        else:
+            attn_bias = attn_mask + attn_bias
+
+    if enable_gqa:
+        key = key.repeat_interleave(query.size(-3)//key.size(-3), -3)
+        value = value.repeat_interleave(query.size(-3)//value.size(-3), -3)
+
+    attn_weight = query @ key.transpose(-2, -1) * scale_factor
+    attn_weight += attn_bias
+    attn_weight = torch.softmax(attn_weight, dim=-1)
+    # PyTorch 1.8 compatibility: use F.dropout instead of torch.dropout
+    attn_weight = F.dropout(attn_weight, p=dropout_p, training=True)
+    return attn_weight @ value
+    
 # RoPE-related functions:
 def rope_rotate_half(x: Tensor) -> Tensor:
     # x:   [ x0  x1  x2  x3  x4  x5]
@@ -58,12 +87,12 @@ class SelfAttention(nn.Module):
         self.scale = head_dim**-0.5
 
         linear_class = LinearKMaskedBias if mask_k_bias else nn.Linear
-        self.qkv = linear_class(dim, dim * 3, bias=qkv_bias, device=device)
+        self.qkv = linear_class(dim, dim * 3, bias=qkv_bias)  # PyTorch 1.8: no device param
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim, bias=proj_bias, device=device)
+        self.proj = nn.Linear(dim, dim, bias=proj_bias)  # PyTorch 1.8: no device param
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def apply_rope(self, q: Tensor, k: Tensor, rope: Tensor | Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
+    def apply_rope(self, q: Tensor, k: Tensor, rope: Union[Tensor, Tuple[Tensor, Tensor]]) -> Tuple[Tensor, Tensor]:    
         # All operations will use the dtype of rope, the output is cast back to the dtype of q and k
         q_dtype = q.dtype
         k_dtype = k.dtype
@@ -113,7 +142,7 @@ class SelfAttention(nn.Module):
         q, k, v = [t.transpose(1, 2) for t in [q, k, v]]
         if rope is not None:
             q, k = self.apply_rope(q, k, rope)
-        x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        x = scaled_dot_product_attention(q, k, v)
         x = x.transpose(1, 2)
         return x.reshape([B, N, C])
 
@@ -140,7 +169,7 @@ class CausalSelfAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
     def init_weights(
-        self, init_attn_std: float | None = None, init_proj_std: float | None = None, factor: float = 1.0
+        self, init_attn_std: Optional[float] = None, init_proj_std: Optional[float] = None, factor: float = 1.0
     ) -> None:
         init_attn_std = init_attn_std or (self.dim**-0.5)
         init_proj_std = init_proj_std or init_attn_std * factor
@@ -156,7 +185,7 @@ class CausalSelfAttention(nn.Module):
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
         q, k, v = torch.unbind(qkv, 2)
         q, k, v = [t.transpose(1, 2) for t in [q, k, v]]
-        x = torch.nn.functional.scaled_dot_product_attention(
+        x = scaled_dot_product_attention(
             q, k, v, attn_mask=None, dropout_p=self.attn_drop if self.training else 0, is_causal=is_causal
         )
         x = x.transpose(1, 2).contiguous().view(B, N, C)
