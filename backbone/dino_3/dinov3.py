@@ -5,7 +5,7 @@
 
 import logging
 from functools import partial
-from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.init
@@ -15,6 +15,7 @@ from .utils import named_apply
 from mmseg.models.builder import BACKBONES
 from mmseg.utils import get_root_logger
 from mmcv_custom import load_checkpoint
+import torch.nn.functional as F
 
 logger = logging.getLogger("dinov3")
 
@@ -66,12 +67,12 @@ class DinoVisionTransformer(nn.Module):
         patch_size: int = 16,
         in_chans: int = 3,
         pos_embed_rope_base: float = 100.0,
-        pos_embed_rope_min_period: float | None = None,
-        pos_embed_rope_max_period: float | None = None,
-        pos_embed_rope_normalize_coords: Literal["min", "max", "separate"] = "separate",
-        pos_embed_rope_shift_coords: float | None = None,
-        pos_embed_rope_jitter_coords: float | None = None,
-        pos_embed_rope_rescale_coords: float | None = None,
+        pos_embed_rope_min_period: Optional[float] = None,
+        pos_embed_rope_max_period: Optional[float] = None,
+        pos_embed_rope_normalize_coords: str = "separate",
+        pos_embed_rope_shift_coords: Optional[float] = None,
+        pos_embed_rope_jitter_coords: Optional[float] = None,
+        pos_embed_rope_rescale_coords: Optional[float] = None,
         pos_embed_rope_dtype: str = "bf16",
         embed_dim: int = 768,
         depth: int = 12,
@@ -79,7 +80,7 @@ class DinoVisionTransformer(nn.Module):
         ffn_ratio: float = 4.0,
         qkv_bias: bool = True,
         drop_path_rate: float = 0.0,
-        layerscale_init: float | None = None,
+        layerscale_init: Optional[float] = None,
         norm_layer: str = "layernorm",
         ffn_layer: str = "mlp",
         ffn_bias: bool = True,
@@ -88,7 +89,10 @@ class DinoVisionTransformer(nn.Module):
         mask_k_bias: bool = False,
         untie_cls_and_patch_norms: bool = False,
         untie_global_and_local_cls_norm: bool = False,
-        device: Any | None = None,
+        device: Optional[Any] = None,
+        out_indices: Optional[List[int]] = None,
+        feat_stride: Optional[int] = None,
+        feat_scale: Optional[List[int]] = None,
         **ignored_kwargs,
     ):
         super().__init__()
@@ -97,6 +101,9 @@ class DinoVisionTransformer(nn.Module):
         del ignored_kwargs
 
         norm_layer_cls = norm_layer_dict[norm_layer]
+        self.out_indices = out_indices
+        self.feat_stride = feat_stride
+        self.feat_scale = feat_scale
 
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         self.n_blocks = depth
@@ -111,10 +118,16 @@ class DinoVisionTransformer(nn.Module):
             flatten_embedding=False,
         )
 
-        self.cls_token = nn.Parameter(torch.empty(1, 1, embed_dim, device=device))
+        # PyTorch 1.8: nn.Parameter doesn't support device param, create tensor first
+        self.cls_token = nn.Parameter(torch.empty(1, 1, embed_dim))
+        if device is not None:
+            self.cls_token.data = self.cls_token.data.to(device)
+        
         self.n_storage_tokens = n_storage_tokens
         if self.n_storage_tokens > 0:
-            self.storage_tokens = nn.Parameter(torch.empty(1, n_storage_tokens, embed_dim, device=device))
+            self.storage_tokens = nn.Parameter(torch.empty(1, n_storage_tokens, embed_dim))
+            if device is not None:
+                self.storage_tokens.data = self.storage_tokens.data.to(device)
         logger.info(f"using base={pos_embed_rope_base} for rope new")
         logger.info(f"using min_period={pos_embed_rope_min_period} for rope new")
         logger.info(f"using max_period={pos_embed_rope_max_period} for rope new")
@@ -179,7 +192,10 @@ class DinoVisionTransformer(nn.Module):
         else:
             self.local_cls_norm = None
         self.head = nn.Identity()
-        self.mask_token = nn.Parameter(torch.empty(1, embed_dim, device=device))
+        # PyTorch 1.8: nn.Parameter doesn't support device param
+        self.mask_token = nn.Parameter(torch.empty(1, embed_dim))
+        if device is not None:
+            self.mask_token.data = self.mask_token.data.to(device)
 
     def init_weights(self, pretrained=None):
         """Initialize weights from pretrained checkpoint or use default initialization.
@@ -275,7 +291,7 @@ class DinoVisionTransformer(nn.Module):
             )
         return output
 
-    def forward_features(self, x: Tensor | List[Tensor], masks: Optional[Tensor] = None) -> List[Dict[str, Tensor]]:
+    def forward_features(self, x: Union[Tensor, List[Tensor]], masks: Optional[Tensor] = None) -> List[Dict[str, Tensor]]:
         if isinstance(x, torch.Tensor):
             return self.forward_features_list([x], [masks])[0]
         else:
@@ -336,9 +352,18 @@ class DinoVisionTransformer(nn.Module):
         elif return_class_token and return_extra_tokens:
             return tuple(zip(outputs, class_tokens, extra_tokens))
 
-    def forward(self, *args, is_training: bool = False, **kwargs) -> List[Dict[str, Tensor]] | Tensor:
-        ret = self.forward_features(*args, **kwargs)
-        if is_training:
-            return ret
-        else:
-            return self.head(ret["x_norm_clstoken"])
+    # def forward(self, *args, is_training: bool = False, **kwargs) -> Union[List[Dict[str, Tensor]], Tensor]:
+    #     ret = self.forward_features(*args, **kwargs)
+    #     if is_training:
+    #         return ret
+    #     else:
+    #         return self.head(ret["x_norm_clstoken"])
+
+    def get_multi_scale_features(self, x: Tensor) -> List[Tensor]:
+        output_features = self.get_intermediate_layers(x, n=12)
+        h, w = x.shape[-2:]
+        h, w = h//self.feat_stride, w//self.feat_stride
+        return [F.interpolate(output_features[i].reshape(-1, h, w, self.embed_dim).permute(0, 3, 1, 2).contiguous(), scale_factor=self.feat_scale[j], mode='bilinear', align_corners=False) for j, i in enumerate(self.out_indices)]
+
+    def forward(self, x: Tensor) -> List[Tensor]:
+        return self.get_multi_scale_features(x)

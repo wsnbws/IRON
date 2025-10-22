@@ -82,9 +82,11 @@ def update_24sparsity(root_module: nn.Module, enabled: bool) -> int:
         return module
 
     named_apply(maybe_apply_sparsity, root_module)
-    # Force re-compile everything
-    torch._dynamo.reset_code_caches()
-    from torch._inductor.cudagraph_trees import reset_cudagraph_trees
-
-    reset_cudagraph_trees()
+    # Force re-compile everything (PyTorch 2.0+ feature, skip for PyTorch 1.8)
+    try:
+        torch._dynamo.reset_code_caches()
+        from torch._inductor.cudagraph_trees import reset_cudagraph_trees
+        reset_cudagraph_trees()
+    except (AttributeError, ImportError):
+        pass  # PyTorch 1.8 doesn't support _dynamo
     return num_modified
