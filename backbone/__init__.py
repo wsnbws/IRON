@@ -1,3 +1,3 @@
-from . import convmae,mae,video_convmae,static_convmae
+from . import convmae,mae,video_convmae,static_convmae, dino_3
 
-__all__ = ['convmae','mae','video_convmae','static_convmae']
+__all__ = ['convmae','mae','video_convmae','static_convmae','dino_3']
