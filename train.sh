@@ -1,7 +1,7 @@
-export CUDA_VISIBLE_DEVICES=0,1,2,3 
+export CUDA_VISIBLE_DEVICES=0,1 
 
 # # 使用convmae的vit-s进行视频训练，使用任务切换方法，含有空mask约束 (原生 sam decoder)
-python -m torch.distributed.launch --nproc_per_node=4 \
+python -m torch.distributed.launch --nproc_per_node=2 \
     ./custom_train.py ./configs/convmae/convmae_video_vits.py \
     --launcher pytorch --work-dir ./out/vits_convmae --seed 24 --deterministic \
     --options model.pretrained=./out/convmae_small.pth
@@ -25,7 +25,7 @@ python -m torch.distributed.launch --nproc_per_node=4 \
 #     --options model.pretrained=./out/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
 
 
-python -m torch.distributed.launch --nproc_per_node=4 \
-    ./custom_train.py ./configs/convmae/simple_temporal.py \
-    --launcher pytorch --work-dir ./out/simple_dinov3_vits --seed 24 --deterministic \
-    --options model.pretrained=./out/dinov3_vits16_pretrain_lvd1689m-08c60483.pth
+# python -m torch.distributed.launch --nproc_per_node=4 \
+#     ./custom_train.py ./configs/convmae/simple_temporal.py \
+#     --launcher pytorch --work-dir ./out/simple_dinov3_vits --seed 24 --deterministic \
+#     --options model.pretrained=./out/dinov3_vits16_pretrain_lvd1689m-08c60483.pth
