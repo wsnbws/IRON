@@ -1,1 +1,1 @@
-from . import predict_temporal, non_memory
+from . import predict_temporal, non_memory, simple_temporalhead
