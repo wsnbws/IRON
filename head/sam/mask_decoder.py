@@ -68,6 +68,7 @@ class MaskDecoder(nn.Module):
         hist_cont_prompt_embeddings: torch.Tensor = None,
         high_res_features: Optional[List[torch.Tensor]] = None,
         step: int = 0,
+        queue_has_hint: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Predict a single mask given image and point prompt embeddings.
@@ -89,14 +90,15 @@ class MaskDecoder(nn.Module):
         background_embed = self.background_proj(self.background_embed.weight.unsqueeze(0).expand(B, -1, -1))  # (B, 1, C)
         # hist_cont_prompt_embeddings = hist_cont_prompt_embeddings.unsqueeze(1)
         # tokens = torch.cat((output_tokens, sparse_prompt_embeddings, hist_cont_prompt_embeddings), dim=1)  # (B, 1+N+M, C)
+        state = get_task_state() if self.training else get_test_task_state()
         if step == 0:
-            state = get_task_state() if self.training else get_test_task_state()
             tokens = torch.cat((output_tokens, float(state)*dr_embed + (1-float(state))*background_embed), dim=1)  # (B, 1+1, C)
         else:
+            no_queue_hint = (1 - queue_has_hint.float()).unsqueeze(1)
             if self.training:
-                tokens = output_tokens + 0 * dr_embed + 0 * background_embed
+                tokens = torch.cat((output_tokens, float(state) * no_queue_hint * dr_embed + (1-float(state)) * queue_has_hint * background_embed), dim=1)
             else:
-                tokens = output_tokens
+                tokens = torch.cat((output_tokens, float(state) * no_queue_hint * dr_embed + (1-float(state)) * queue_has_hint * background_embed), dim=1)
                 # tokens = torch.cat((output_tokens, dr_embed), dim=1)
                     
         b, c, h, w = src.shape

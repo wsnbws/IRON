@@ -195,6 +195,7 @@ class PredictiveTemporalUPerHead(nn.Module):
             self.temporal_queue.reset_state(all_batch=True)
 
         historical_frames, historical_masks = self.temporal_queue.get_history_frames()
+        queue_has_hint = self._check_queue_hints(historical_masks)
         batch_frames = historical_frames.view(-1, *historical_frames.shape[2:])
         batch_masks = historical_masks.view(-1, *historical_masks.shape[2:])
 
@@ -217,7 +218,23 @@ class PredictiveTemporalUPerHead(nn.Module):
         batch_pos_enc = batch_memory_output["vision_pos_enc"]
         batch_pos_enc = batch_pos_enc + batch_time_enc
         
-        return mem_features, batch_pos_enc, batch_masks
+        return mem_features, batch_pos_enc, batch_masks, queue_has_hint
+
+    def _check_queue_hints(self, historical_masks, ratio=0.1):
+        """ hist T,B,1,H,W """
+        T, B, C, mask_H, mask_W = historical_masks.shape
+
+        high_confidence_pixels = (historical_masks > 0.5).sum(dim=(-2, -1))  # (T, B, 1)
+
+        max_t_batch_pixels = high_confidence_pixels.max(dim=0).values  # (B, 1)
+
+        total_pixels = mask_H * mask_W
+        threshold_pixels = total_pixels * ratio
+
+        queue_has_hint = (max_t_batch_pixels > threshold_pixels).float()  # (B, 1)
+
+        return queue_has_hint
+
 
     def _format_memory_full(self, mem_features, batch_pos_enc, B):
         """Format base memory as full spatial memory for attention."""
@@ -240,7 +257,7 @@ class PredictiveTemporalUPerHead(nn.Module):
         cur_features_seq = cur_features.flatten(2).permute(2, 0, 1)  # (H*W, B, C)
         cur_pos_enc_seq = cur_pos_enc.flatten(2).permute(2, 0, 1)  # (H*W, B, C)
     
-        base_mem_features, base_pos_enc, batch_masks = self._get_memory_base(cur_features, t, timestamps)
+        base_mem_features, base_pos_enc, batch_masks, queue_has_hint = self._get_memory_base(cur_features, t, timestamps)
         memory_enc_full, mem_features_full = self._format_memory_full(base_mem_features, base_pos_enc, B)
         
         fus_feat, hist_feat = self.memory_attention(
@@ -263,7 +280,8 @@ class PredictiveTemporalUPerHead(nn.Module):
             # sparse_prompt_embeddings=sparse_prompt_embeddings,  # Point prompts: (B, N, C)
             # hist_cont_prompt_embeddings=final_global_token,  # Historical context: (B, 1, C)
             high_res_features=fpn_outs[:-1],  # High-resolution features (empty for now),
-            step=t
+            step=t,
+            queue_has_hint=queue_has_hint
         )
         
         if self.training:
