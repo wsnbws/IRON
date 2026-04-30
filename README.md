@@ -59,9 +59,7 @@ Each column shows a different scene type; rows show the aligned RGB image, infra
 
 The IRON dataset is available on Baidu Netdisk:
 
-> **Baidu Netdisk:** [Coming soon — link will be updated upon paper acceptance]
-
-<!-- Baidu link placeholder: https://pan.baidu.com/s/xxxxx  code: xxxx -->
+> **Baidu Netdisk:** [https://pan.baidu.com/s/1UYPkj6nHYQRu2SFo7UuwGw?pwd=eiz6](https://pan.baidu.com/s/1UYPkj6nHYQRu2SFo7UuwGw?pwd=eiz6)  （提取码：eiz6）
 
 ---
 
