@@ -5,10 +5,6 @@
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
 > **Towards All-Day Perception for Off-Road Driving: A Large-Scale Multispectral Dataset and Comprehensive Benchmark**
->
-> Shuo Wang, Jilin Mei, Wenfei Guan, Shuai Wang, Yan Xing, Chen Min†, Yu Hu†
->
-> Institute of Computing Technology, Chinese Academy of Sciences
 
 ---
 
