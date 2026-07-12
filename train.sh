@@ -13,7 +13,7 @@ mkdir -p $WORK_DIR
 if [ $NUM_GPUS -eq 1 ]; then
     python custom_train.py $CONFIG \
         --work-dir $WORK_DIR \
-        --seed 24 --deterministic \
+        --seed 42 --deterministic \
         --options model.pretrained=$PRETRAINED
 else
     python -m torch.distributed.launch \
@@ -22,6 +22,6 @@ else
         custom_train.py $CONFIG \
         --launcher pytorch \
         --work-dir $WORK_DIR \
-        --seed 24 --deterministic \
+        --seed 42 --deterministic \
         --options model.pretrained=$PRETRAINED
 fi
